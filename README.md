@@ -1,10 +1,17 @@
 # LedgerFlow — Event-Driven Payment Processing System
 
-LedgerFlow is a small educational payment simulator for demonstrating a REST API, durable data, event-driven processing, caching, cloud object storage, queues, and containers. It never contacts a bank or handles real money.
+LedgerFlow is an event-driven payment processing simulator built with FastAPI, PostgreSQL, Kafka, Redis, Amazon S3, Amazon SQS, and Docker. It accepts payment requests through a REST API and processes them asynchronously while maintaining account balances, ledger entries, receipts, and notification records.
 
-## Problem and features
+## Features
 
-A payment can take longer than an HTTP request should. LedgerFlow accepts a request immediately as `PENDING`, then a Kafka worker processes it. It supports customer and merchant accounts, simulated funding, success/failure based on balance, double-entry-style ledger records, cached status, JSON receipts, and queued notifications.
+- Customer and merchant account management
+- Decimal-safe balance operations
+- Asynchronous payment processing through Kafka
+- Transactional balance and ledger updates
+- Redis-backed payment status caching
+- JSON receipt storage in Amazon S3 or the local filesystem
+- Notification delivery through Amazon SQS or a local queue
+- Docker Compose environment for local development
 
 ## Architecture
 
@@ -37,9 +44,9 @@ sequenceDiagram
     W->>W: Cache status, store receipt, queue notification
 ```
 
-## One purpose per technology
+## Technology stack
 
-| Technology | Purpose |
+| Technology | Usage |
 |---|---|
 | FastAPI | HTTP API and validation |
 | PostgreSQL | Permanent accounts, payments, ledger, and notifications |
@@ -49,27 +56,27 @@ sequenceDiagram
 | Amazon SQS | Carries notification tasks in AWS mode |
 | Docker Compose | Runs the API, worker, PostgreSQL, Redis, and Kafka locally |
 
-PostgreSQL is always the source of truth. Local mode substitutes a `receipts/` directory and a small JSON queue for AWS, so no credentials are needed.
+PostgreSQL is the source of truth for application data. When AWS integration is disabled, receipts and notification messages are stored locally.
 
 ## Files
 
 ```text
 app.py              FastAPI setup, table creation, and endpoints
 database.py         Engine and sessions
-models.py           Four SQLAlchemy tables
+models.py           SQLAlchemy data models
 schemas.py          Request and response validation
-kafka_client.py     One producer and one consumer
+kafka_client.py     Kafka producer and consumer configuration
 redis_client.py     Payment-status cache
 aws_services.py     S3/SQS and local-mode equivalents
 worker.py           Payment processing
-seed.py             Demo data
-tests.py            Eight focused tests
-docker-compose.yml  Complete local stack
+seed.py             Sample data setup
+tests.py            Automated test suite
+docker-compose.yml  Local service configuration
 ```
 
 ## Run locally with Docker
 
-Requirements: Docker with Compose. Copying `.env.example` is optional because local mode is the default.
+Requirements: Docker with Docker Compose. Copy `.env.example` to configure the application; local storage mode is enabled by default.
 
 ```bash
 cp .env.example .env
@@ -78,17 +85,17 @@ docker compose up --build
 
 API: <http://localhost:8000> · Swagger: <http://localhost:8000/docs>
 
-The Compose service hostnames (`postgres`, `redis`, and `kafka`) are already configured. Kafka is intentionally not published on host port `9092`; only the API and worker need to reach it through Docker's internal network. `Base.metadata.create_all()` creates the four tables when the API starts; there is intentionally no migration framework.
+The API and worker connect to PostgreSQL, Redis, and Kafka through the internal Docker network. Database tables are created during application startup with SQLAlchemy's `Base.metadata.create_all()`.
 
-## Demo
+## Usage
 
-Seed one funded customer and one merchant:
+Create a funded customer account and a merchant account:
 
 ```bash
 docker compose exec api python seed.py
 ```
 
-The script prints both IDs and a ready-to-run payment command. Manual account calls are:
+The script prints both account IDs and a payment request command. Accounts can also be created and funded through the API:
 
 ```bash
 curl -X POST http://localhost:8000/accounts -H 'Content-Type: application/json' \
@@ -98,20 +105,20 @@ curl -X POST http://localhost:8000/accounts/ACCOUNT_ID/fund \
   -H 'Content-Type: application/json' -d '{"amount":"5000.00"}'
 ```
 
-Create a payment (replace the IDs):
+Create a payment after replacing the account IDs:
 
 ```bash
 curl -X POST http://localhost:8000/payments -H 'Content-Type: application/json' \
   -d '{"customer_account_id":"CUSTOMER_ID","merchant_account_id":"MERCHANT_ID","amount":"500.00","currency":"INR","description":"Demo purchase"}'
 ```
 
-Compose starts the worker automatically. To run it separately:
+Docker Compose starts the worker with the application. It can also be run separately:
 
 ```bash
 docker compose run --rm worker python worker.py
 ```
 
-Check a payment and process one notification:
+Retrieve the payment, ledger entries, and receipt, then process a queued notification:
 
 ```bash
 curl http://localhost:8000/payments/PAYMENT_ID
@@ -120,7 +127,7 @@ curl http://localhost:8000/payments/PAYMENT_ID/receipt
 curl http://localhost:8000/notifications/process-one
 ```
 
-Run tests inside the image (tests use SQLite and mocked infrastructure boundaries):
+Run the test suite inside the application image:
 
 ```bash
 docker compose run --rm --no-deps api pytest -q tests.py
@@ -151,21 +158,22 @@ With `USE_AWS=false`, receipts go to `receipts/` and notifications to `local_not
 - Notifications: `GET /notifications`, `GET /notifications/process-one`
 - Health: `GET /health`
 
-## Failure behavior and limitations
+## Failure handling
 
 - Insufficient funds produces `FAILED` without changing either balance.
 - Redis errors are logged and reads fall back to PostgreSQL.
 - S3 or SQS errors are logged after the database transaction; payment completion remains valid.
 - If Kafka publishing fails, the API returns `503` and identifies the saved `PENDING` payment.
-- This learning project has no authentication, retries, deduplication, outbox, reconciliation, or concurrency/load claims. A duplicate Kafka delivery arriving before completion could process twice.
-- Funding is a simulator endpoint, notification processing is intentionally a GET endpoint per the project scope, and local JSON queue access is not designed for concurrent writers.
+- Duplicate Kafka events are ignored after a payment reaches a terminal status.
+- External storage and queue errors do not roll back a completed database transaction.
 
-Future production work could add authentication, idempotency, an outbox, event deduplication, retry and dead-letter queues, migrations, observability, reconciliation, and stronger failure recovery. Those are deliberately excluded here.
+## Limitations
+
+- The system processes simulated funds and does not integrate with banks, cards, or payment networks.
+- Authentication, authorization, idempotency, event deduplication, and an outbox are not implemented.
+- Kafka retry topics, a dead-letter queue, schema migrations, and reconciliation jobs are not implemented.
+- The local JSON notification queue is intended for single-process development only.
 
 ## Security disclaimer
 
-LedgerFlow is not a payment gateway, is not PCI-DSS compliant, and must not be used with real customers, cards, UPI, bank accounts, or money. Never commit `.env` or AWS credentials.
-
-## Resume-ready description
-
-> Built LedgerFlow, an educational event-driven payment simulator using FastAPI, PostgreSQL, Kafka, Redis, Docker, Amazon S3, and Amazon SQS. Implemented asynchronous payment processing, transactional balance and ledger updates, cached status reads, receipt storage, and queued notifications.
+LedgerFlow is a simulation and is not a payment gateway or a PCI-DSS-compliant system. Do not use it to process real financial data or credentials. Keep `.env` files and AWS credentials outside version control.
