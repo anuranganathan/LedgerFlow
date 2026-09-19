@@ -1,179 +1,183 @@
-# LedgerFlow — Event-Driven Payment Processing System
+# LedgerFlow — Event-Driven Payment Processing on AWS
 
-LedgerFlow is an event-driven payment processing simulator built with FastAPI, PostgreSQL, Kafka, Redis, Amazon S3, Amazon SQS, and Docker. It accepts payment requests through a REST API and processes them asynchronously while maintaining account balances, ledger entries, receipts, and notification records.
+LedgerFlow is an event-driven payment processing system built with a focus on reliability, asynchronous processing and cloud integration. A REST API accepts payments, Kafka hands them to a background worker, and the worker moves money with a double-entry ledger. Receipts go to Amazon S3, notifications flow through Amazon SQS to Slack, and metrics and logs go to Amazon CloudWatch. A Jenkins pipeline tests, builds and deploys it to AWS EC2.
 
-## Features
+**Live demo:** _EC2 URL added after deployment_ · **API docs:** `/docs`
 
-- Customer and merchant account management
-- Decimal-safe balance operations
-- Asynchronous payment processing through Kafka
-- Transactional balance and ledger updates
-- Redis-backed payment status caching
-- JSON receipt storage in Amazon S3 or the local filesystem
-- Notification delivery through Amazon SQS or a local queue
-- Docker Compose environment for local development
+> Simulation only: no real money, banks or card data are involved.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    Client --> API[FastAPI]
+    Client[Dashboard / REST client] --> API[FastAPI]
     API --> DB[(PostgreSQL)]
     API --> Cache[(Redis)]
-    API --> Kafka[Kafka: payment-events]
+    API -- PAYMENT_CREATED --> Kafka[[Kafka]]
     Kafka --> Worker[Payment worker]
     Worker --> DB
-    Worker --> Cache
-    Worker --> S3[Amazon S3 / local receipts]
-    Worker --> SQS[Amazon SQS / local queue]
+    Worker -- receipt --> S3[(Amazon S3)]
+    Worker -- event --> SQS[[Amazon SQS]]
+    Worker -- metrics --> CW[Amazon CloudWatch]
+    SQS --> Notifier[Notifier]
+    Notifier --> Slack[Slack #payment-alerts]
+    SQS -. after 3 failures .-> DLQ[[Dead-letter queue]]
+    CW -- alarm --> SNS[Amazon SNS alert]
 ```
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant A as FastAPI
-    participant K as Kafka
-    participant W as Worker
-    participant P as PostgreSQL
-    C->>A: POST /payments
-    A->>P: Save PENDING
-    A->>K: PAYMENT_CREATED
-    A-->>C: 202 PENDING
-    K->>W: Payment ID
-    W->>P: PROCESSING, balances, ledger, final status
-    W->>W: Cache status, store receipt, queue notification
+**What happens to one payment**
+
+1. `POST /payments` validates the request, saves the payment as `PENDING` in PostgreSQL and publishes a `PAYMENT_CREATED` event to Kafka. The API returns `202 Accepted` right away.
+2. The **worker** consumes the event, locks the rows, checks the balance and writes two ledger entries (DEBIT the customer, CREDIT the merchant) in one database transaction.
+3. For a successful payment, the worker stores a JSON **receipt in S3**.
+4. The worker sends an event to **SQS** and publishes `PaymentsSucceeded` / `PaymentsFailed` and processing-time **metrics to CloudWatch**.
+5. The **notifier** reads SQS and posts the result to **Slack**. It deletes the message only after Slack accepts it, so if Slack is down the message is retried. After 3 failed attempts it moves to a **dead-letter queue**.
+6. A **CloudWatch alarm** fires when 3 or more payments fail within 5 minutes.
+
+## Tech stack
+
+| Area | Tools | Used for |
+|---|---|---|
+| Backend | Python, FastAPI, SQLAlchemy, Pydantic | REST API, validation, data models |
+| Database / cache | PostgreSQL, Redis | Source of truth; short-lived payment status cache |
+| Messaging | Kafka, Amazon SQS | Kafka for payment events, SQS for notifications |
+| AWS | boto3, S3, SQS, CloudWatch (metrics, logs, alarms), SNS, IAM, EC2 | Storage, queues, monitoring, hosting |
+| DevOps | Docker, Docker Compose, Jenkins, LocalStack | Containers, CI/CD, local AWS |
+| Integrations | Slack incoming webhooks | Payment alerts in a channel |
+| Testing | pytest, moto | API, worker, AWS and Slack behaviour |
+
+## DevOps and cloud
+
+### CI/CD with Jenkins
+
+The [`Jenkinsfile`](Jenkinsfile) defines the pipeline:
+
+```
+git push → Jenkins → install deps → pytest → docker build → deploy to EC2 (SSH + deploy.sh) → health check
 ```
 
-## Technology stack
+- Test results are published to Jenkins as JUnit reports.
+- The deploy stage runs [`deploy.sh`](deploy.sh) on the server. It pulls the code, rebuilds the containers and fails the build if `/health` doesn't respond.
+- Jenkins itself runs in Docker: `docker compose -f jenkins/docker-compose.yml up -d --build`, then open <http://localhost:8080>.
 
-| Technology | Usage |
+### AWS automation with Python (boto3)
+
+No AWS resources are created by hand; two scripts create them:
+
+- [`setup_aws.py`](setup_aws.py) creates the S3 bucket (public access blocked), the SQS queue plus a dead-letter queue, a CloudWatch log group, an SNS alert topic and the CloudWatch alarm. It's idempotent, so running it again changes nothing. Locally it runs against LocalStack automatically on `docker compose up`.
+- [`provision_ec2.py`](provision_ec2.py) builds the server: an IAM role, an SSH key pair, a security group, an EC2 instance and an Elastic IP. The server installs Docker on first boot and deploys itself. `python provision_ec2.py destroy` removes the server to stop charges.
+
+### Monitoring (CloudWatch)
+
+| Signal | Where |
 |---|---|
-| FastAPI | HTTP API and validation |
-| PostgreSQL | Permanent accounts, payments, ledger, and notifications |
-| Kafka | Sends payment-created events to the asynchronous worker |
-| Redis | Caches only the latest payment status for 10 minutes |
-| Amazon S3 | Stores successful-payment JSON receipts in AWS mode |
-| Amazon SQS | Carries notification tasks in AWS mode |
-| Docker Compose | Runs the API, worker, PostgreSQL, Redis, and Kafka locally |
+| `PaymentsSucceeded`, `PaymentsFailed`, `NotificationsFailed` | CloudWatch metrics, namespace `LedgerFlow` |
+| `PaymentProcessingTime` (ms) | CloudWatch metric |
+| API, worker and notifier logs | CloudWatch Logs group `/ledgerflow/app` (Docker `awslogs` driver) |
+| 3+ failed payments in 5 minutes | CloudWatch alarm → SNS topic `ledgerflow-alerts` |
+| Is the app up? | `GET /health` (checks the database), used by `deploy.sh` |
 
-PostgreSQL is the source of truth for application data. When AWS integration is disabled, receipts and notification messages are stored locally.
+### Security
 
-## Files
+- The EC2 server gets AWS access through an **IAM role**, so no access keys exist on the server or in the repo.
+- The role follows **least privilege**: it only gets `PutObject`/`GetObject` on the one bucket, send/receive/delete on the one queue, metrics limited to the `LedgerFlow` namespace, and writes to the one log group.
+- The security group opens HTTP to everyone but **SSH only to the admin's IP**. The server uses IMDSv2.
+- The S3 bucket blocks all public access. Secrets such as the database password and Slack webhook live in a `.env` file that is never committed.
 
-```text
-app.py              FastAPI setup, table creation, and endpoints
-database.py         Engine and sessions
-models.py           SQLAlchemy data models
-schemas.py          Request and response validation
-kafka_client.py     Kafka producer and consumer configuration
-redis_client.py     Payment-status cache
-aws_services.py     S3/SQS and local-mode equivalents
-worker.py           Payment processing
-seed.py             Sample data setup
-tests.py            Automated test suite
-docker-compose.yml  Local service configuration
-```
+## Run locally
 
-## Run locally with Docker
-
-Requirements: Docker with Docker Compose. Copy `.env.example` to configure the application; local storage mode is enabled by default.
+Requirements: Docker Desktop.
 
 ```bash
-cp .env.example .env
+cp .env.example .env        # optional: add a Slack webhook URL
 docker compose up --build
 ```
 
-API: <http://localhost:8000> · Swagger: <http://localhost:8000/docs>
+Open <http://localhost:8000> and click **Create demo accounts**, then send a payment. Try an amount larger than the balance to see a `FAILED` payment. Swagger UI is at <http://localhost:8000/docs>.
 
-The API and worker connect to PostgreSQL, Redis, and Kafka through the internal Docker network. Database tables are created during application startup with SQLAlchemy's `Base.metadata.create_all()`.
+Everything runs locally, including AWS: LocalStack emulates S3, SQS, CloudWatch and SNS, and `setup_aws.py` provisions them on startup. Without a Slack webhook, the notifier logs the Slack message instead (`docker compose logs notifier`).
 
-## Usage
-
-Create a funded customer account and a merchant account:
+### Tests
 
 ```bash
-docker compose exec api python seed.py
+pip install -r requirements-dev.txt
+pytest -q tests.py
 ```
 
-The script prints both account IDs and a payment request command. Accounts can also be created and funded through the API:
+The tests use SQLite and **moto**, an in-memory mock of AWS, so they need no Docker or AWS account. They cover:
 
-```bash
-curl -X POST http://localhost:8000/accounts -H 'Content-Type: application/json' \
-  -d '{"name":"Demo Customer","account_type":"CUSTOMER","currency":"INR"}'
+- account and payment APIs
+- successful and failed payments and the double-entry ledger
+- Redis fallback
+- S3 receipts, SQS messages and CloudWatch metrics
+- Slack delivery, including retries when Slack is down
+- running the AWS setup script twice
 
-curl -X POST http://localhost:8000/accounts/ACCOUNT_ID/fund \
-  -H 'Content-Type: application/json' -d '{"amount":"5000.00"}'
+### Slack
+
+In Slack, create an app, enable **Incoming Webhooks**, add a webhook for a channel such as `#payment-alerts` and put the URL in `.env` as `SLACK_WEBHOOK_URL`. Messages look like:
+
+```
+❌ Payment FAILED
+Payment ID: 118bf6e0-1fb2-46d7-8960-d4ffdd20eba4
+Amount: 9000.00 INR
+Reason: Insufficient balance
 ```
 
-Create a payment after replacing the account IDs:
+## API
 
-```bash
-curl -X POST http://localhost:8000/payments -H 'Content-Type: application/json' \
-  -d '{"customer_account_id":"CUSTOMER_ID","merchant_account_id":"MERCHANT_ID","amount":"500.00","currency":"INR","description":"Demo purchase"}'
-```
-
-Docker Compose starts the worker with the application. It can also be run separately:
-
-```bash
-docker compose run --rm worker python worker.py
-```
-
-Retrieve the payment, ledger entries, and receipt, then process a queued notification:
-
-```bash
-curl http://localhost:8000/payments/PAYMENT_ID
-curl http://localhost:8000/payments/PAYMENT_ID/ledger
-curl http://localhost:8000/payments/PAYMENT_ID/receipt
-curl http://localhost:8000/notifications/process-one
-```
-
-Run the test suite inside the application image:
-
-```bash
-docker compose run --rm --no-deps api pytest -q tests.py
-```
-
-## Environment variables
-
-| Variable | Default / meaning |
-|---|---|
-| `DATABASE_URL` | PostgreSQL connection URL |
-| `REDIS_URL` | Redis connection URL |
-| `KAFKA_BOOTSTRAP_SERVERS` | Kafka broker address |
-| `USE_AWS` | `false` uses local files; `true` uses S3 and SQS |
-| `AWS_REGION` | AWS region, default `ap-south-1` |
-| `S3_BUCKET` | Existing receipt bucket name |
-| `SQS_QUEUE_URL` | Existing `payflow-notifications` queue URL |
-
-### AWS setup
-
-Create one private S3 bucket and one standard SQS queue named `payflow-notifications`. Give the runtime identity permission for `s3:PutObject`, `s3:GetObject`, `sqs:SendMessage`, `sqs:ReceiveMessage`, and `sqs:DeleteMessage` on only those resources. Set `USE_AWS=true`, the bucket name, queue URL, and region. Boto3 uses the normal AWS credential chain; credentials are never stored in this repository.
-
-With `USE_AWS=false`, receipts go to `receipts/` and notifications to `local_notifications.json`. Neither AWS credentials nor network access to AWS is required.
-
-## API summary
-
-- Accounts: `POST /accounts`, `GET /accounts`, `GET /accounts/{id}`, `POST /accounts/{id}/fund`
-- Payments: `POST /payments`, `GET /payments`, `GET /payments/{id}`, `GET /payments/{id}/ledger`, `GET /payments/{id}/receipt`
-- Notifications: `GET /notifications`, `GET /notifications/process-one`
-- Health: `GET /health`
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/accounts` | Create a customer or merchant account |
+| GET | `/accounts`, `/accounts/{id}` | List or get accounts |
+| POST | `/accounts/{id}/fund` | Add money to an account |
+| POST | `/payments` | Create a payment (returns `202` + `PENDING`) |
+| GET | `/payments`, `/payments/{id}` | List or get payments |
+| GET | `/payments/{id}/ledger` | Double-entry ledger lines for a payment |
+| GET | `/payments/{id}/receipt` | Receipt read back from S3 |
+| GET | `/notifications` | Notification records and whether they were sent |
+| GET | `/health` | Health check (includes a database query) |
 
 ## Failure handling
 
-- Insufficient funds produces `FAILED` without changing either balance.
-- Redis errors are logged and reads fall back to PostgreSQL.
-- S3 or SQS errors are logged after the database transaction; payment completion remains valid.
-- If Kafka publishing fails, the API returns `503` and identifies the saved `PENDING` payment.
-- Duplicate Kafka events are ignored after a payment reaches a terminal status.
-- External storage and queue errors do not roll back a completed database transaction.
+| Failure | Behaviour |
+|---|---|
+| Insufficient balance | Payment becomes `FAILED`, no balance changes, metric + Slack alert |
+| Kafka down when creating a payment | API returns `503`; the payment stays saved as `PENDING` |
+| Same Kafka event delivered twice | Ignored once the payment is `SUCCESS`/`FAILED` |
+| Redis down | Logged; reads fall back to PostgreSQL |
+| S3 or SQS down | Logged; the committed payment is not rolled back |
+| Slack down | Message stays in SQS and is retried, then moves to the dead-letter queue |
+| CloudWatch down | Metric is skipped; payment processing continues |
 
-## Limitations
+## Project structure
 
-- The system processes simulated funds and does not integrate with banks, cards, or payment networks.
-- Authentication, authorization, idempotency, event deduplication, and an outbox are not implemented.
-- Kafka retry topics, a dead-letter queue, schema migrations, and reconciliation jobs are not implemented.
-- The local JSON notification queue is intended for single-process development only.
+```text
+app.py               FastAPI app and endpoints
+worker.py            Kafka consumer that processes payments
+notifier.py          SQS consumer that sends Slack messages
+models.py            SQLAlchemy tables: accounts, payments, ledger_entries, notifications
+schemas.py           Pydantic request/response models
+database.py          Database engine and sessions
+kafka_client.py      Kafka producer/consumer
+redis_client.py      Payment status cache
+aws_services.py      boto3 helpers for S3, SQS and CloudWatch
+slack_client.py      Slack webhook client
+setup_aws.py         Creates S3 / SQS / CloudWatch / SNS resources
+provision_ec2.py     Creates IAM role, security group and EC2 server
+deploy.sh            Deploy script run on the server
+static/index.html    Dashboard
+tests.py             pytest suite
+Jenkinsfile          CI/CD pipeline
+jenkins/             Jenkins in Docker
+docker-compose.yml       Local stack (with LocalStack)
+docker-compose.prod.yml  Production stack on EC2 (real AWS)
+```
 
-## Security disclaimer
+## Limitations and next steps
 
-LedgerFlow is a simulation and is not a payment gateway or a PCI-DSS-compliant system. Do not use it to process real financial data or credentials. Keep `.env` files and AWS credentials outside version control.
+- One EC2 instance runs everything. In production I'd use managed services (RDS for PostgreSQL, ElastiCache for Redis, MSK for Kafka) and run the app on ECS.
+- Jenkins builds the image, but the server also rebuilds it. Pushing a versioned image to Amazon ECR would make deploys faster and rollbacks easy.
+- The demo is served over plain HTTP, with no domain or TLS.
+- There is no authentication, and no idempotency keys on `POST /payments`.
+- Infrastructure is scripted with boto3. Terraform or CloudFormation would add drift detection and plan/apply reviews.
