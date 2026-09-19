@@ -2,7 +2,7 @@
 
 LedgerFlow is an event-driven payment processing system built with a focus on reliability, asynchronous processing and cloud integration. A REST API accepts payments, Kafka hands them to a background worker, and the worker moves money with a double-entry ledger. Receipts go to Amazon S3, notifications flow through Amazon SQS to Slack, and metrics and logs go to Amazon CloudWatch. A Jenkins pipeline tests, builds and deploys it to AWS EC2.
 
-**Live demo:** _EC2 URL added after deployment_ · **API docs:** `/docs`
+**Live demo:** <http://52.66.120.13> · **API docs:** <http://52.66.120.13/docs> (hosted on AWS EC2, ap-south-1)
 
 > Simulation only: no real money, banks or card data are involved.
 
