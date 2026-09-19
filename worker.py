@@ -1,4 +1,5 @@
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -25,6 +26,7 @@ def process_payment(payment_id: uuid.UUID | str, db: Session) -> Payment | None:
         logger.info("Payment %s is already complete; ignoring event", payment_id)
         return payment
 
+    started = time.perf_counter()
     payment.status = PaymentStatus.PROCESSING
     db.commit()
     set_payment_status(payment.id, PaymentStatus.PROCESSING.value)
@@ -83,18 +85,28 @@ def process_payment(payment_id: uuid.UUID | str, db: Session) -> Payment | None:
         except Exception:
             logger.exception("Receipt storage failed for payment %s", payment.id)
 
-    notification_body = {
-        "payment_id": str(payment.id),
-        "status": payment.status.value,
-        "message": message,
-    }
     notification = Notification(payment_id=payment.id, message=message)
     db.add(notification)
     db.commit()
     try:
-        aws_services.send_notification(notification_body)
+        aws_services.send_notification(
+            {
+                "notification_id": str(notification.id),
+                "payment_id": str(payment.id),
+                "status": payment.status.value,
+                "amount": str(payment.amount),
+                "currency": payment.currency,
+                "reason": payment.failure_reason or "",
+            }
+        )
     except Exception:
         logger.exception("Notification queueing failed for payment %s", payment.id)
+
+    succeeded = payment.status == PaymentStatus.SUCCESS
+    aws_services.put_metric("PaymentsSucceeded" if succeeded else "PaymentsFailed")
+    aws_services.put_metric(
+        "PaymentProcessingTime", (time.perf_counter() - started) * 1000, "Milliseconds"
+    )
     logger.info("Payment %s completed with status %s", payment.id, payment.status.value)
     return payment
 

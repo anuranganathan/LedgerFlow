@@ -1,0 +1,3 @@
+-r requirements.txt
+pytest==8.4.1
+moto[s3,sqs,cloudwatch]==5.1.11

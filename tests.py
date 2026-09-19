@@ -3,29 +3,38 @@ import uuid
 from decimal import Decimal
 
 os.environ["DATABASE_URL"] = "sqlite:///./test_payflow.db"
-os.environ["USE_AWS"] = "false"
+os.environ.pop("AWS_ENDPOINT_URL", None)
+os.environ["AWS_ACCESS_KEY_ID"] = "testing"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
 
 import pytest
 from fastapi.testclient import TestClient
+from moto import mock_aws
 from sqlalchemy import select
 
 import app as app_module
+import aws_services
+import notifier
+import setup_aws
 import worker
 from app import app
 from database import Base, SessionLocal, engine
-from models import Account, AccountType, EntryType, LedgerEntry, Payment, PaymentStatus
+from models import Account, EntryType, LedgerEntry, Notification, NotificationStatus, PaymentStatus
 
 
 @pytest.fixture(autouse=True)
-def clean_database(monkeypatch, tmp_path):
+def clean_environment(monkeypatch):
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     monkeypatch.setattr(app_module, "publish_payment_created", lambda _: None)
     monkeypatch.setattr(app_module, "set_payment_status", lambda *_: None)
     monkeypatch.setattr(worker, "set_payment_status", lambda *_: None)
-    monkeypatch.setattr(worker.aws_services, "RECEIPTS_DIR", tmp_path / "receipts")
-    monkeypatch.setattr(worker.aws_services, "LOCAL_QUEUE_FILE", tmp_path / "queue.json")
-    yield
+    # moto fakes AWS in memory, so the real setup script creates the bucket and queues.
+    with mock_aws():
+        setup_aws.create_bucket()
+        setup_aws.create_queues()
+        setup_aws.create_monitoring()
+        yield
     Base.metadata.drop_all(bind=engine)
 
 
@@ -121,3 +130,68 @@ def test_redis_failure_falls_back_to_postgresql(client, monkeypatch):
     result = client.get(f"/payments/{response.json()['payment_id']}")
     assert result.status_code == 200
     assert result.json()["status"] == "PENDING"
+
+
+def test_successful_payment_stores_receipt_in_s3(client):
+    response, customer, _ = create_payment(client, "300.00")
+    client.post(f"/accounts/{customer['id']}/fund", json={"amount": "1000.00"})
+    with SessionLocal() as db:
+        worker.process_payment(response.json()["payment_id"], db)
+    receipt = client.get(f"/payments/{response.json()['payment_id']}/receipt")
+    assert receipt.status_code == 200
+    assert receipt.json()["amount"] == "300.00"
+    assert receipt.json()["status"] == "SUCCESS"
+
+
+def test_failed_payment_sends_sqs_message_and_metric(client):
+    response, _, _ = create_payment(client)
+    with SessionLocal() as db:
+        worker.process_payment(response.json()["payment_id"], db)
+    messages = aws_services.receive_notifications()
+    assert len(messages) == 1
+    assert messages[0]["body"]["status"] == "FAILED"
+    assert messages[0]["body"]["reason"] == "Insufficient balance"
+    metrics = aws_services.client("cloudwatch").list_metrics(Namespace="LedgerFlow")["Metrics"]
+    assert "PaymentsFailed" in {metric["MetricName"] for metric in metrics}
+
+
+def test_notifier_posts_to_slack_and_marks_notification_sent(client, monkeypatch):
+    sent = []
+    monkeypatch.setattr(notifier, "send_slack_message", sent.append)
+    response, _, _ = create_payment(client)
+    with SessionLocal() as db:
+        worker.process_payment(response.json()["payment_id"], db)
+    for message in aws_services.receive_notifications():
+        notifier.handle_message(message)
+    assert "Payment FAILED" in sent[0]
+    assert "Insufficient balance" in sent[0]
+    assert aws_services.receive_notifications() == []
+    with SessionLocal() as db:
+        assert db.scalars(select(Notification)).one().status == NotificationStatus.SENT
+
+
+def test_slack_failure_keeps_message_in_queue(client, monkeypatch):
+    def slack_down(_):
+        raise RuntimeError("Slack unavailable")
+
+    monkeypatch.setattr(notifier, "send_slack_message", slack_down)
+    response, _, _ = create_payment(client)
+    with SessionLocal() as db:
+        worker.process_payment(response.json()["payment_id"], db)
+    message = aws_services.receive_notifications()[0]
+    with pytest.raises(RuntimeError):
+        notifier.handle_message(message)
+    # The message was not deleted, so SQS will deliver it again (and later move it to the DLQ).
+    sqs = aws_services.client("sqs")
+    sqs.change_message_visibility(
+        QueueUrl=aws_services.queue_url(), ReceiptHandle=message["receipt_handle"], VisibilityTimeout=0
+    )
+    assert len(aws_services.receive_notifications()) == 1
+
+
+def test_setup_aws_is_safe_to_run_twice():
+    setup_aws.create_bucket()
+    setup_aws.create_queues()
+    setup_aws.create_monitoring()
+    alarms = aws_services.client("cloudwatch").describe_alarms()["MetricAlarms"]
+    assert [alarm["AlarmName"] for alarm in alarms] == ["ledgerflow-failed-payments"]

@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LedgerFlow</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #667085; --border: #e4e7ec;
+    --accent: #2f5bea; --ok: #12805c; --ok-bg: #e3f6ee; --bad: #c0362c; --bad-bg: #fdecea;
+    --wait: #a15c07; --wait-bg: #fdf3e2;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #11141a; --card: #1a1e26; --text: #e6e8ec; --muted: #9aa3b2; --border: #2a303b;
+      --accent: #7c9cff; --ok: #4cd29a; --ok-bg: #16352a; --bad: #ff8a80; --bad-bg: #3b1d1b;
+      --wait: #f5b454; --wait-bg: #3a2c14;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; }
+  h1 { margin: 0; font-size: 22px; }
+  h2 { margin: 0 0 12px; font-size: 15px; }
+  a { color: var(--accent); }
+  .muted { color: var(--muted); }
+  .flow { margin: 12px 0 20px; padding: 10px 14px; background: var(--card); border: 1px solid var(--border);
+          border-radius: 8px; font-family: ui-monospace, Menlo, monospace; font-size: 12px; overflow-x: auto; white-space: nowrap; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; min-width: 0; }
+  .wide { grid-column: 1 / -1; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 7px 6px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  .scroll { overflow-x: auto; }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover { background: var(--bg); }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  .badge { padding: 2px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; }
+  .SUCCESS { color: var(--ok); background: var(--ok-bg); }
+  .FAILED { color: var(--bad); background: var(--bad-bg); }
+  .PENDING, .PROCESSING { color: var(--wait); background: var(--wait-bg); }
+  form { display: grid; gap: 10px; }
+  label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+  input, select, button { font: inherit; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border);
+                          background: var(--card); color: var(--text); }
+  button { background: var(--accent); color: #fff; border: 0; cursor: pointer; font-weight: 600; }
+  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #message { min-height: 20px; margin-top: 8px; }
+  pre { background: var(--bg); padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 12px; margin: 8px 0 0; }
+  .empty { color: var(--muted); padding: 12px 0; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>LedgerFlow</h1>
+      <div class="muted">Event-driven payment processing: FastAPI, Kafka, PostgreSQL, Redis, AWS S3, SQS and CloudWatch</div>
+    </div>
+    <div class="row"><a href="/docs">API docs (Swagger)</a><a href="https://github.com/anuranganathan/LedgerFlow">GitHub</a></div>
+  </header>
+
+  <div class="flow">POST /payments → PostgreSQL (PENDING) → Kafka → worker → double-entry ledger → S3 receipt → SQS → notifier → Slack &nbsp;|&nbsp; metrics → CloudWatch</div>
+
+  <div class="grid">
+    <section class="card">
+      <h2>Accounts</h2>
+      <div class="scroll"><table>
+        <thead><tr><th>Name</th><th>Type</th><th class="num">Balance</th></tr></thead>
+        <tbody id="accounts"></tbody>
+      </table></div>
+      <div class="row" style="margin-top:12px">
+        <button class="secondary" id="demo">Create demo accounts</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>New payment</h2>
+      <form id="payment-form">
+        <label>Customer <select id="customer" required></select></label>
+        <label>Merchant <select id="merchant" required></select></label>
+        <label>Amount (INR) <input id="amount" type="number" min="0.01" step="0.01" value="500" required></label>
+        <label>Description <input id="description" value="Demo purchase" maxlength="200"></label>
+        <button type="submit">Send payment</button>
+      </form>
+      <div id="message" class="muted"></div>
+    </section>
+
+    <section class="card wide">
+      <h2>Payments <span class="muted" style="font-weight:400">(click a row for its ledger entries and S3 receipt)</span></h2>
+      <div class="scroll"><table>
+        <thead><tr><th>Payment ID</th><th>Description</th><th class="num">Amount</th><th>Status</th><th>Reason</th><th>Created</th></tr></thead>
+        <tbody id="payments"></tbody>
+      </table></div>
+      <div id="details"></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let accounts = [];
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {headers: {"Content-Type": "application/json"}, ...options});
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.detail ? JSON.stringify(body.detail) : response.statusText);
+  return body;
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+}
+
+function fillSelect(select, type) {
+  const current = select.value;
+  select.innerHTML = accounts.filter((a) => a.account_type === type)
+    .map((a) => `<option value="${a.id}">${escapeHtml(a.name)} (₹${a.balance})</option>`).join("");
+  if (current) select.value = current;
+}
+
+async function loadAccounts() {
+  accounts = await api("/accounts");
+  $("accounts").innerHTML = accounts.length ? accounts.map((a) => `
+    <tr><td>${escapeHtml(a.name)}</td><td>${a.account_type}</td><td class="num">₹${a.balance}</td></tr>`).join("")
+    : `<tr><td colspan="3" class="empty">No accounts yet. Create demo accounts to start.</td></tr>`;
+  fillSelect($("customer"), "CUSTOMER");
+  fillSelect($("merchant"), "MERCHANT");
+}
+
+async function loadPayments() {
+  const payments = await api("/payments");
+  $("payments").innerHTML = payments.length ? payments.slice(0, 20).map((p) => `
+    <tr class="clickable" data-id="${p.id}">
+      <td class="mono">${p.id.slice(0, 8)}</td>
+      <td>${escapeHtml(p.description)}</td>
+      <td class="num">₹${p.amount}</td>
+      <td><span class="badge ${p.status}">${p.status}</span></td>
+      <td>${escapeHtml(p.failure_reason)}</td>
+      <td class="muted">${new Date(p.created_at).toLocaleTimeString()}</td>
+    </tr>`).join("")
+    : `<tr><td colspan="6" class="empty">No payments yet.</td></tr>`;
+}
+
+async function showDetails(paymentId) {
+  const ledger = await api(`/payments/${paymentId}/ledger`);
+  const receipt = await api(`/payments/${paymentId}/receipt`).catch(() => null);
+  const names = Object.fromEntries(accounts.map((a) => [a.id, a.name]));
+  $("details").innerHTML = `
+    <h2 style="margin-top:20px">Payment <span class="mono">${paymentId}</span></h2>
+    ${ledger.length ? `<table>
+      <thead><tr><th>Ledger entry</th><th>Account</th><th class="num">Amount</th></tr></thead>
+      <tbody>${ledger.map((e) => `<tr><td>${e.entry_type}</td><td>${escapeHtml(names[e.account_id])}</td><td class="num">₹${e.amount}</td></tr>`).join("")}</tbody>
+    </table>` : `<div class="empty">No ledger entries: the payment failed, so no money moved.</div>`}
+    ${receipt ? `<div class="muted" style="margin-top:12px">Receipt stored in S3:</div><pre>${escapeHtml(JSON.stringify(receipt, null, 2))}</pre>` : ""}`;
+}
+
+async function refresh() {
+  try { await loadAccounts(); await loadPayments(); }
+  catch (error) { $("message").textContent = `Could not reach the API: ${error.message}`; }
+}
+
+$("demo").addEventListener("click", async () => {
+  const customer = await api("/accounts", {method: "POST", body: JSON.stringify({name: "Demo Customer", account_type: "CUSTOMER"})});
+  await api(`/accounts/${customer.id}/fund`, {method: "POST", body: JSON.stringify({amount: "5000.00"})});
+  await api("/accounts", {method: "POST", body: JSON.stringify({name: "Demo Merchant", account_type: "MERCHANT"})});
+  $("message").textContent = "Created a customer with ₹5000 and a merchant.";
+  refresh();
+});
+
+$("payment-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const result = await api("/payments", {method: "POST", body: JSON.stringify({
+      customer_account_id: $("customer").value, merchant_account_id: $("merchant").value,
+      amount: $("amount").value, currency: "INR", description: $("description").value,
+    })});
+    $("message").textContent = `Accepted as ${result.status}. The worker is processing it through Kafka...`;
+    refresh();
+  } catch (error) {
+    $("message").textContent = `Payment rejected: ${error.message}`;
+  }
+});
+
+$("payments").addEventListener("click", (event) => {
+  const row = event.target.closest("tr[data-id]");
+  if (row) showDetails(row.dataset.id);
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

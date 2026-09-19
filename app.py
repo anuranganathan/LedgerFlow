@@ -3,13 +3,14 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, status
-from sqlalchemy import select
+from fastapi.responses import FileResponse
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 import aws_services
 from database import Base, engine, get_db
 from kafka_client import publish_payment_created
-from models import Account, AccountType, LedgerEntry, Notification, NotificationStatus, Payment
+from models import Account, AccountType, LedgerEntry, Notification, Payment
 from redis_client import get_payment_status, set_payment_status
 from schemas import (
     AccountCreate, AccountResponse, FundRequest, LedgerResponse, NotificationResponse,
@@ -40,8 +41,15 @@ def get_or_404(db: Session, model, object_id: uuid.UUID):
     return item
 
 
+@app.get("/", include_in_schema=False)
+def dashboard():
+    return FileResponse("static/index.html")
+
+
 @app.get("/health")
-def health() -> dict[str, str]:
+def health(db: Session = Depends(get_db)) -> dict[str, str]:
+    # Used by Docker and the deploy step to check the API can reach the database.
+    db.execute(text("SELECT 1"))
     return {"status": "ok"}
 
 
@@ -130,29 +138,9 @@ def get_receipt(payment_id: uuid.UUID, db: Session = Depends(get_db)):
     payment = get_or_404(db, Payment, payment_id)
     if not payment.receipt_s3_key:
         raise HTTPException(status_code=404, detail="Receipt is not available")
-    return aws_services.receipt_location(payment.receipt_s3_key)
+    return aws_services.read_receipt(payment.receipt_s3_key)
 
 
 @app.get("/notifications", response_model=list[NotificationResponse])
 def list_notifications(db: Session = Depends(get_db)):
     return db.scalars(select(Notification).order_by(Notification.created_at.desc())).all()
-
-
-@app.get("/notifications/process-one")
-def process_one_notification(db: Session = Depends(get_db)):
-    queued = aws_services.receive_notification()
-    if queued is None:
-        return {"message": "No notification available"}
-    body = queued["body"]
-    print(body)
-    notification = db.scalar(
-        select(Notification).where(
-            Notification.payment_id == uuid.UUID(body["payment_id"]),
-            Notification.status == NotificationStatus.QUEUED,
-        ).order_by(Notification.created_at)
-    )
-    if notification:
-        notification.status = NotificationStatus.SENT
-        db.commit()
-    aws_services.delete_notification(queued.get("receipt_handle"))
-    return body

@@ -1,26 +1,33 @@
+# Local development: the whole system, with LocalStack standing in for AWS.
 services:
   api:
     build: .
     command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:8000"
     volumes:
       - .:/app
     environment: &app-environment
       DATABASE_URL: postgresql+psycopg2://payflow:payflow@postgres:5432/payflow
       REDIS_URL: redis://redis:6379/0
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      USE_AWS: ${USE_AWS:-false}
-      AWS_REGION: ${AWS_REGION:-ap-south-1}
-      S3_BUCKET: ${S3_BUCKET:-payflow-receipts}
-      SQS_QUEUE_URL: ${SQS_QUEUE_URL:-}
-    depends_on:
+      AWS_REGION: ap-south-1
+      AWS_ENDPOINT_URL: http://localstack:4566
+      # LocalStack accepts any credentials; these are not real AWS keys.
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      S3_BUCKET: ledgerflow-receipts
+      SQS_QUEUE_NAME: ledgerflow-notifications
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+    depends_on: &app-dependencies
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
       kafka:
         condition: service_healthy
+      aws-setup:
+        condition: service_completed_successfully
 
   worker:
     build: .
@@ -28,13 +35,29 @@ services:
     volumes:
       - .:/app
     environment: *app-environment
+    depends_on: *app-dependencies
+
+  notifier:
+    build: .
+    command: python notifier.py
+    volumes:
+      - .:/app
+    environment: *app-environment
+    depends_on: *app-dependencies
+
+  # Runs setup_aws.py once to create the bucket, queues and CloudWatch alarm, then exits.
+  aws-setup:
+    build: .
+    command: python setup_aws.py
+    environment: *app-environment
     depends_on:
-      postgres:
+      localstack:
         condition: service_healthy
-      redis:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
+
+  localstack:
+    image: localstack/localstack:3.8.1
+    environment:
+      SERVICES: s3,sqs,cloudwatch,logs,sns
 
   postgres:
     image: postgres:16-alpine
@@ -42,8 +65,6 @@ services:
       POSTGRES_DB: payflow
       POSTGRES_USER: payflow
       POSTGRES_PASSWORD: payflow
-    ports:
-      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -54,8 +75,6 @@ services:
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -76,6 +95,7 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_HEAP_OPTS: -Xmx256m -Xms256m
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:
