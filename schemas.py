@@ -2,11 +2,11 @@ import os
 import uuid
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
-from models import AccountType, EntryType, NotificationStatus, PaymentStatus, RefundStatus
+from models import AccountType, EntryType, NotificationStatus, PaymentStatus, RefundStatus, UserRole
 
 SUPPORTED_CURRENCIES = set(os.getenv("SUPPORTED_CURRENCIES", "INR,USD,EUR,GBP").split(","))
 MAX_TOP_UP = Decimal("1000000.00")
@@ -28,15 +28,33 @@ class ORMModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
-def user_account_type(value: AccountType) -> AccountType:
-    if value == AccountType.SYSTEM:
-        raise ValueError("account_type must be CUSTOMER or MERCHANT")
-    return value
+class RegisterRequest(BaseModel):
+    email: str = Field(max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    password: str = Field(min_length=10, max_length=128)
+    name: str = Field(min_length=1, max_length=100)
+    # Admins can't sign up; they're created with create_admin.py.
+    role: Literal["CUSTOMER", "MERCHANT"]
+    currency: Currency = "INR"
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
+class UserResponse(ORMModel):
+    id: uuid.UUID
+    email: str
+    name: str
+    role: UserRole
+    created_at: datetime
 
 
 class AccountCreate(BaseModel):
+    """A new account for the logged-in user; its type follows the user's role."""
+
     name: str = Field(min_length=1, max_length=100)
-    account_type: Annotated[AccountType, AfterValidator(user_account_type)]
     currency: Currency = "INR"
 
 
@@ -45,8 +63,15 @@ class FundRequest(BaseModel):
     description: str = Field(default="Top-up", min_length=1, max_length=200)
 
 
+class MerchantResponse(ORMModel):
+    id: uuid.UUID
+    name: str
+    currency: str
+
+
 class AccountResponse(ORMModel):
     id: uuid.UUID
+    owner_id: uuid.UUID | None
     name: str
     account_type: AccountType
     balance: Decimal
@@ -126,3 +151,7 @@ class Page(BaseModel):
 
     limit: int = Field(default=50, ge=1, le=100)
     offset: int = Field(default=0, ge=0)
+
+
+class MeResponse(UserResponse):
+    accounts: list[AccountResponse]

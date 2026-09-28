@@ -4,6 +4,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 git pull --ff-only
+
+# Secrets added by newer versions of the app are generated once and kept in .env.
+if ! grep -q '^JWT_SECRET=' .env; then
+  echo "JWT_SECRET=$(openssl rand -hex 32)" >> .env
+fi
 docker compose -f docker-compose.prod.yml up -d --build
 docker image prune -f
 

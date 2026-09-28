@@ -19,6 +19,9 @@ services:
       S3_BUCKET: ledgerflow-receipts
       SQS_QUEUE_NAME: ledgerflow-notifications
       SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      # Local development only; production gets a random secret (see deploy.sh).
+      JWT_SECRET: ${JWT_SECRET:-local-development-jwt-secret-not-for-production}
+      COOKIE_SECURE: "false"
     depends_on: &app-dependencies
       postgres:
         condition: service_healthy

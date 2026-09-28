@@ -24,7 +24,8 @@ from sqlalchemy.orm import Session
 import aws_services
 from database import SessionLocal
 from models import (
-    Account, EntryType, LedgerEntry, OutboxEvent, Payment, PaymentStatus, Refund, RefundStatus,
+    Account, EntryType, IdempotencyKey, LedgerEntry, OutboxEvent, Payment, PaymentStatus, RefreshToken,
+    Refund, RefundStatus,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 INTERVAL_SECONDS = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "300"))
 STUCK_AFTER = timedelta(minutes=5)
 KEEP_PUBLISHED_EVENTS = timedelta(days=7)
+KEEP_IDEMPOTENCY_KEYS = timedelta(hours=24)
 MAX_LISTED = 20
 CENT = Decimal("0.01")
 
@@ -152,12 +154,15 @@ def run_checks(db: Session) -> dict:
     }
 
 
-def delete_old_outbox_events(db: Session) -> int:
-    """Published events are only kept for a week, so the outbox table doesn't grow forever."""
-    cutoff = datetime.now(timezone.utc) - KEEP_PUBLISHED_EVENTS
-    deleted = db.execute(delete(OutboxEvent).where(
-        OutboxEvent.published_at.is_not(None), OutboxEvent.published_at < cutoff
-    )).rowcount
+def delete_expired_rows(db: Session) -> int:
+    """Keeps housekeeping tables small: old published events, idempotency keys and sessions."""
+    now = datetime.now(timezone.utc)
+    deleted = sum(db.execute(statement).rowcount for statement in [
+        delete(OutboxEvent).where(
+            OutboxEvent.published_at.is_not(None), OutboxEvent.published_at < now - KEEP_PUBLISHED_EVENTS),
+        delete(IdempotencyKey).where(IdempotencyKey.created_at < now - KEEP_IDEMPOTENCY_KEYS),
+        delete(RefreshToken).where(RefreshToken.expires_at < now),
+    ])
     db.commit()
     return deleted
 
@@ -165,12 +170,12 @@ def delete_old_outbox_events(db: Session) -> int:
 def run_once() -> dict:
     with SessionLocal() as db:
         report = run_checks(db)
-        deleted = delete_old_outbox_events(db)
+        deleted = delete_expired_rows(db)
     stuck = report["stuck_payments"] + report["stuck_refunds"] + report["stale_outbox_events"]
     aws_services.put_metric("LedgerMismatches", report["ledger_problems"])
     aws_services.put_metric("StuckItems", stuck)
     if report["ok"]:
-        logger.info("Reconciliation passed (deleted %d old outbox events)", deleted)
+        logger.info("Reconciliation passed (deleted %d expired rows)", deleted)
     else:
         logger.error("Reconciliation found problems: %s", report)
     return report

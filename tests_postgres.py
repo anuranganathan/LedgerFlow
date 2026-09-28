@@ -21,7 +21,9 @@ os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
 os.environ.pop("AWS_ENDPOINT_URL", None)
 os.environ["AWS_ACCESS_KEY_ID"] = "testing"
 os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
+os.environ["JWT_SECRET"] = "test-secret-that-is-long-enough-for-hs256"
 
+import fakeredis
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
@@ -29,13 +31,18 @@ from alembic.runtime.migration import MigrationContext
 from moto import mock_aws
 from sqlalchemy import func, select, text
 
+import app as app_module
+import auth
 import aws_services
 import ledger
+import redis_client
 import reconcile
 import setup_aws
 import worker
 from database import Base, SessionLocal, engine
-from models import Account, AccountType, EntryType, LedgerEntry, OutboxEvent, Payment, PaymentStatus
+from models import (
+    Account, AccountType, EntryType, LedgerEntry, OutboxEvent, Payment, PaymentStatus, User, UserRole,
+)
 
 
 def reset_database() -> None:
@@ -51,7 +58,8 @@ def migrate(revision: str = "head") -> None:
 def database(monkeypatch):
     reset_database()
     migrate()
-    monkeypatch.setattr(worker, "set_payment_status", lambda *_: None)
+    monkeypatch.setattr(redis_client, "client", fakeredis.FakeRedis(decode_responses=True))
+    monkeypatch.setattr(app_module, "rate_limit", lambda *args, **kwargs: None)  # tests hammer on purpose
     aws_services.client.cache_clear()
     aws_services.queue_url.cache_clear()
     with mock_aws():
@@ -60,9 +68,23 @@ def database(monkeypatch):
         yield
 
 
-def add_accounts(balance: str) -> tuple[uuid.UUID, uuid.UUID]:
+def add_user(role: UserRole) -> User:
     with SessionLocal() as db:
-        customer = Account(name="C", account_type=AccountType.CUSTOMER, balance=Decimal("0"), currency="INR")
+        user = User(email=f"{uuid.uuid4().hex[:8]}@example.com", name=role.value, role=role,
+                    password_hash=auth.hash_password("irrelevant password"))
+        db.add(user)
+        db.commit()
+        return user
+
+
+def headers_for(user: User) -> dict[str, str]:
+    return {"Authorization": f"Bearer {auth.create_access_token(user)}"}
+
+
+def add_accounts(balance: str, owner: User | None = None) -> tuple[uuid.UUID, uuid.UUID]:
+    with SessionLocal() as db:
+        customer = Account(name="C", account_type=AccountType.CUSTOMER, balance=Decimal("0"), currency="INR",
+                           owner_id=owner.id if owner else None)
         merchant = Account(name="M", account_type=AccountType.MERCHANT, balance=Decimal("0"), currency="INR")
         db.add_all([customer, merchant])
         db.commit()
@@ -134,8 +156,9 @@ def test_funding_during_payments_loses_no_update(client_factory=None):
 
     customer, merchant = add_accounts("0.00")
     payment_ids = add_payments(customer, merchant, "10.00", 20)
+    admin = headers_for(add_user(UserRole.ADMIN))
     with TestClient(app) as client, ThreadPoolExecutor(max_workers=40) as pool:
-        funding = [pool.submit(client.post, f"/accounts/{customer}/fund", json={"amount": "10.00"})
+        funding = [pool.submit(client.post, f"/accounts/{customer}/fund", json={"amount": "10.00"}, headers=admin)
                    for _ in range(20)]
         processing = [pool.submit(process_in_parallel, [payment_id]) for payment_id in payment_ids]
         assert all(future.result().status_code == 200 for future in funding)
@@ -159,9 +182,11 @@ def test_concurrent_refund_requests_cannot_refund_more_than_the_payment():
     customer, merchant = add_accounts("100.00")
     (payment_id,) = add_payments(customer, merchant, "100.00", 1)
     process_in_parallel([payment_id])
+    admin = headers_for(add_user(UserRole.ADMIN))
     with TestClient(app) as client, ThreadPoolExecutor(max_workers=10) as pool:
         responses = list(pool.map(
-            lambda _: client.post(f"/payments/{payment_id}/refunds", json={"amount": "40.00"}), range(10)
+            lambda _: client.post(f"/payments/{payment_id}/refunds", json={"amount": "40.00"}, headers=admin),
+            range(10),
         ))
     assert sorted(r.status_code for r in responses).count(202) == 2  # 40 + 40 <= 100 < 120
     refund_ids = [r.json()["id"] for r in responses if r.status_code == 202]
@@ -175,6 +200,24 @@ def test_concurrent_refund_requests_cannot_refund_more_than_the_payment():
     assert balance(customer) == Decimal("80.00")
     assert balance(merchant) == Decimal("20.00")
     assert_books_balance()
+
+
+def test_parallel_retries_with_one_idempotency_key_create_one_payment():
+    from fastapi.testclient import TestClient
+
+    from app import app
+
+    user = add_user(UserRole.CUSTOMER)
+    customer, merchant = add_accounts("100.00", owner=user)
+    headers = {**headers_for(user), "Idempotency-Key": "checkout-7"}
+    body = {"customer_account_id": str(customer), "merchant_account_id": str(merchant), "amount": "5.00"}
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=10) as pool:
+        responses = list(pool.map(lambda _: client.post("/payments", json=body, headers=headers), range(10)))
+    assert {r.status_code for r in responses} == {202}
+    assert len({r.json()["payment_id"] for r in responses}) == 1
+    with SessionLocal() as db:
+        assert db.scalar(select(func.count()).select_from(Payment)) == 1
+        assert db.scalar(select(func.count()).select_from(OutboxEvent)) == 1
 
 
 def test_migrations_match_the_models_on_postgresql():

@@ -24,7 +24,6 @@ import kafka_client
 from database import SessionLocal
 from ledger import lock, transfer
 from models import Account, Notification, Payment, PaymentStatus, Refund, RefundStatus, utc_now
-from redis_client import set_payment_status
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -71,7 +70,6 @@ def process_payment(payment_id: uuid.UUID | str, db: Session) -> Payment | None:
     if payment.status == PaymentStatus.PENDING:
         settle(db, payment)
         db.commit()
-        set_payment_status(payment.id, payment.status.value)
         aws_services.put_metric(
             "PaymentsSucceeded" if payment.status == PaymentStatus.SUCCESS else "PaymentsFailed"
         )
