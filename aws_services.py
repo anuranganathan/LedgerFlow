@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from functools import cache
 from typing import Any
 
 import boto3
@@ -15,10 +16,13 @@ SQS_QUEUE_NAME = os.getenv("SQS_QUEUE_NAME", "ledgerflow-notifications")
 METRICS_NAMESPACE = "LedgerFlow"
 
 
+@cache
 def client(service: str):
+    """One client per service and process; boto3 clients are thread-safe and slow to create."""
     return boto3.client(service, region_name=AWS_REGION, endpoint_url=AWS_ENDPOINT_URL)
 
 
+@cache
 def queue_url() -> str:
     return client("sqs").get_queue_url(QueueName=SQS_QUEUE_NAME)["QueueUrl"]
 

@@ -70,36 +70,31 @@ def create_monitoring() -> None:
     if ALERT_EMAIL:
         sns.subscribe(TopicArn=topic_arn, Protocol="email", Endpoint=ALERT_EMAIL)
 
-    # Alert when 3 or more payments fail within 5 minutes.
-    client("cloudwatch").put_metric_alarm(
-        AlarmName="ledgerflow-failed-payments",
-        Namespace=METRICS_NAMESPACE,
-        MetricName="PaymentsFailed",
-        Statistic="Sum",
-        Period=300,
-        EvaluationPeriods=1,
-        Threshold=3,
-        ComparisonOperator="GreaterThanOrEqualToThreshold",
-        TreatMissingData="notBreaching",
-        AlarmActions=[topic_arn],
-    )
-    print("CloudWatch alarm ledgerflow-failed-payments ready")
-
+    alarm(topic_arn, "ledgerflow-failed-payments", "PaymentsFailed", threshold=3)  # 3+ in 5 minutes
     # Any event in the Kafka dead-letter topic needs a person to look at it.
+    alarm(topic_arn, "ledgerflow-dead-lettered-events", "PaymentEventsDeadLettered", threshold=1)
+    alarm(topic_arn, "ledgerflow-ledger-mismatch", "LedgerMismatches", threshold=1)
+    # The reconciler reports StuckItems every 5 minutes. No data for 15 minutes means the
+    # reconciler itself stopped, which is also worth an alert.
+    alarm(topic_arn, "ledgerflow-stuck-items", "StuckItems", threshold=1, period=900,
+          statistic="Maximum", missing_data="breaching")
+
+
+def alarm(topic_arn: str, name: str, metric: str, threshold: float, period: int = 300,
+          statistic: str = "Sum", missing_data: str = "notBreaching") -> None:
     client("cloudwatch").put_metric_alarm(
-        AlarmName="ledgerflow-dead-lettered-events",
+        AlarmName=name,
         Namespace=METRICS_NAMESPACE,
-        MetricName="PaymentEventsDeadLettered",
-        Statistic="Sum",
-        Period=300,
+        MetricName=metric,
+        Statistic=statistic,
+        Period=period,
         EvaluationPeriods=1,
-        Threshold=1,
+        Threshold=threshold,
         ComparisonOperator="GreaterThanOrEqualToThreshold",
-        TreatMissingData="notBreaching",
+        TreatMissingData=missing_data,
         AlarmActions=[topic_arn],
     )
-    print("CloudWatch alarm ledgerflow-dead-lettered-events ready")
-
+    print(f"CloudWatch alarm {name} ready")
 
 if __name__ == "__main__":
     create_bucket()

@@ -51,6 +51,24 @@ Every step can crash or find a dependency down, so each hand-off is designed to 
 
 These are covered by tests, including concurrency tests on real PostgreSQL (`tests_postgres.py`).
 
+## The ledger
+
+Every change to a balance is a **double-entry transfer** written by `ledger.py`: one DEBIT and one CREDIT of the same amount, in the same transaction as the balance update.
+
+| Movement | DEBIT | CREDIT |
+|---|---|---|
+| Top-up (`POST /accounts/{id}/fund`) | System account for the currency ("External funds") | The account |
+| Payment | Customer | Merchant |
+| Refund (`POST /payments/{id}/refunds`) | Merchant | Customer |
+
+The **system account** stands for money entering from outside (a bank or card). Its balance is minus everything ever added, so across a currency all balances sum to zero and every rupee can be traced to where it came from.
+
+Safeguards:
+- **Database constraints**: customer and merchant balances can't go negative, amounts must be positive, a payment's refunded total can't exceed its amount, and every ledger entry belongs to exactly one payment or top-up.
+- **Refunds** can be full or partial and go through the same outbox → Kafka → worker path as payments. The API locks the payment while checking the refundable amount (pending refunds count), so parallel requests can't refund more than was paid. A refund fails if the merchant no longer has the money.
+- **Reconciliation** (`reconcile.py`, every 5 minutes, and `GET /reconciliation`) checks that every balance equals its ledger entries, debits equal credits per currency, every successful payment has exactly one debit and one credit, and refund totals match. It also flags payments, refunds or outbox events stuck for over 5 minutes. Problems raise CloudWatch alarms; the job never changes money itself.
+- **Validation**: amounts must be positive with at most 2 decimal places and fit the database column; currencies must be supported (`SUPPORTED_CURRENCIES`, default `INR,USD,EUR,GBP`).
+
 ## Tech stack
 
 | Area | Tools | Used for |
@@ -89,11 +107,14 @@ No AWS resources are created by hand; two scripts create them:
 | Signal | Where |
 |---|---|
 | `PaymentsSucceeded`, `PaymentsFailed`, `NotificationsFailed` | CloudWatch metrics, namespace `LedgerFlow` |
-| `PaymentEventsDeadLettered`, `OutboxPublishFailures` | CloudWatch metrics |
+| `PaymentEventsDeadLettered`, `OutboxPublishFailures`, `RefundsSucceeded`, `RefundsFailed` | CloudWatch metrics |
+| `LedgerMismatches`, `StuckItems` | CloudWatch metrics from the reconciler |
 | `PaymentProcessingTime` (ms, from request to settlement) | CloudWatch metric |
 | API, worker and notifier logs | CloudWatch Logs group `/ledgerflow/app` (Docker `awslogs` driver) |
 | 3+ failed payments in 5 minutes | CloudWatch alarm → SNS topic `ledgerflow-alerts` |
 | Any event dead-lettered | CloudWatch alarm → SNS topic `ledgerflow-alerts` |
+| Any ledger mismatch | CloudWatch alarm → SNS |
+| Anything stuck for 5+ minutes, or the reconciler stopped reporting | CloudWatch alarm → SNS (missing data counts as a problem) |
 | Is the app up? | `GET /health` (checks the database), used by `deploy.sh` |
 
 ### Security
@@ -147,7 +168,8 @@ The tests cover:
 - successful and failed payments and the double-entry ledger
 - the outbox and relay (including Kafka being down), offset commits, retries and the dead-letter topic
 - duplicate events and crash recovery, without moving money twice
-- concurrent payments and top-ups on PostgreSQL
+- concurrent payments, top-ups and refund requests on PostgreSQL
+- top-ups and refunds in the ledger, validation, database constraints and reconciliation
 - Redis fallback
 - S3 receipts, SQS messages and CloudWatch metrics
 - Slack delivery, including retries when Slack is down
@@ -170,12 +192,18 @@ Reason: Insufficient balance
 |---|---|---|
 | POST | `/accounts` | Create a customer or merchant account |
 | GET | `/accounts`, `/accounts/{id}` | List or get accounts |
-| POST | `/accounts/{id}/fund` | Add money to an account |
+| POST | `/accounts/{id}/fund` | Top up an account (recorded in the ledger) |
+| GET | `/accounts/{id}/ledger` | Account statement: its ledger entries |
 | POST | `/payments` | Create a payment (returns `202` + `PENDING`) |
 | GET | `/payments`, `/payments/{id}` | List or get payments |
-| GET | `/payments/{id}/ledger` | Double-entry ledger lines for a payment |
+| GET | `/payments/{id}/ledger` | Double-entry ledger lines for a payment and its refunds |
+| POST | `/payments/{id}/refunds` | Refund all or part of a payment (returns `202` + `PENDING`) |
+| GET | `/payments/{id}/refunds`, `/refunds/{id}` | List or get refunds |
+| GET | `/reconciliation` | Run the ledger checks now |
 | GET | `/payments/{id}/receipt` | Receipt read back from S3 |
 | GET | `/notifications` | Notification records and whether they were sent |
+
+List endpoints take `limit` (1–100, default 50) and `offset`.
 | GET | `/health` | Health check (includes a database query) |
 
 ## Failure handling
@@ -183,6 +211,8 @@ Reason: Insufficient balance
 | Failure | Behaviour |
 |---|---|
 | Insufficient balance | Payment becomes `FAILED`, no balance changes, metric + Slack alert |
+| Merchant can't cover a refund | Refund becomes `FAILED`, no balance changes, metric + Slack alert |
+| A balance doesn't match the ledger | Reconciler reports it and the CloudWatch alarm fires |
 | Kafka down when creating a payment | API still returns `202`; the event waits in the outbox and the relay publishes it when Kafka is back |
 | Worker crashes mid-payment | Offset wasn't committed, so Kafka redelivers the event; the money transaction either fully happened or not at all |
 | Same Kafka event delivered twice | Money moves once; missing side effects are completed, existing ones aren't repeated |
@@ -197,12 +227,14 @@ Reason: Insufficient balance
 
 ```text
 app.py               FastAPI app and endpoints
+ledger.py            Double-entry transfers, top-ups and row locking
+reconcile.py         Ledger checks and stuck-item detection (runs every 5 minutes)
 outbox.py            Writes events to the outbox table
 relay.py             Publishes outbox events to Kafka
-worker.py            Kafka consumer that processes payments (retries, dead-letter topic)
+worker.py            Kafka consumer that settles payments and refunds (retries, dead-letter topic)
 replay_dlq.py        Lists or replays dead-lettered events
 notifier.py          SQS consumer that sends Slack messages
-models.py            SQLAlchemy tables: accounts, payments, ledger_entries, notifications, outbox_events
+models.py            SQLAlchemy tables: accounts, payments, refunds, top_ups, ledger_entries, notifications, outbox_events
 migrations/          Alembic database migrations
 schemas.py           Pydantic request/response models
 database.py          Database engine and sessions
