@@ -55,6 +55,7 @@ class PaymentCreate(BaseModel):
 class PaymentAccepted(BaseModel):
     payment_id: uuid.UUID
     status: PaymentStatus
+    status_url: str
     message: str
 
 

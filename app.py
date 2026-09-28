@@ -1,16 +1,15 @@
 import logging
 import uuid
-from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.responses import FileResponse
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 import aws_services
-from database import Base, engine, get_db
-from kafka_client import publish_payment_created
-from models import Account, AccountType, LedgerEntry, Notification, Payment
+from database import get_db
+from models import Account, AccountType, LedgerEntry, Notification, Payment, PaymentStatus
+from outbox import add_payment_event
 from redis_client import get_payment_status, set_payment_status
 from schemas import (
     AccountCreate, AccountResponse, FundRequest, LedgerResponse, NotificationResponse,
@@ -19,18 +18,12 @@ from schemas import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    yield
-
-
+# The database schema is created and upgraded by Alembic migrations (alembic upgrade head),
+# which run before the app starts. See migrations/.
 app = FastAPI(
     title="LedgerFlow",
     description="Educational event-driven payment processing simulator",
     version="1.0.0",
-    lifespan=lifespan,
 )
 
 
@@ -74,7 +67,13 @@ def get_account(account_id: uuid.UUID, db: Session = Depends(get_db)):
 
 @app.post("/accounts/{account_id}/fund", response_model=AccountResponse)
 def fund_account(account_id: uuid.UUID, data: FundRequest, db: Session = Depends(get_db)):
-    account = get_or_404(db, Account, account_id)
+    # Lock the row so a payment settling at the same moment can't overwrite this update.
+    account = db.scalar(
+        select(Account).where(Account.id == account_id).with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if account is None:
+        raise HTTPException(status_code=404, detail="Account not found")
     account.balance += data.amount
     db.commit()
     db.refresh(account)
@@ -82,7 +81,7 @@ def fund_account(account_id: uuid.UUID, data: FundRequest, db: Session = Depends
 
 
 @app.post("/payments", response_model=PaymentAccepted, status_code=202)
-def create_payment(data: PaymentCreate, db: Session = Depends(get_db)):
+def create_payment(data: PaymentCreate, response: Response, db: Session = Depends(get_db)):
     customer = get_or_404(db, Account, data.customer_account_id)
     merchant = get_or_404(db, Account, data.merchant_account_id)
     if customer.account_type != AccountType.CUSTOMER:
@@ -93,24 +92,21 @@ def create_payment(data: PaymentCreate, db: Session = Depends(get_db)):
     if customer.currency != currency or merchant.currency != currency:
         raise HTTPException(status_code=400, detail="Payment and account currencies must match")
     payment = Payment(
-        customer_account_id=customer.id, merchant_account_id=merchant.id,
+        id=uuid.uuid4(), customer_account_id=customer.id, merchant_account_id=merchant.id,
         amount=data.amount, currency=currency, description=data.description,
+        status=PaymentStatus.PENDING,
     )
     db.add(payment)
+    # The payment and its PAYMENT_CREATED event are committed together (transactional outbox).
+    # relay.py publishes the event to Kafka, so the payment is processed even if Kafka is down now.
+    add_payment_event(db, "PAYMENT_CREATED", payment.id)
     db.commit()
-    db.refresh(payment)
     set_payment_status(payment.id, payment.status.value)
-    try:
-        publish_payment_created(payment.id)
-    except Exception as exc:
-        logging.exception("Kafka publish failed for payment %s", payment.id)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Payment saved as PENDING, but Kafka is unavailable: {payment.id}",
-        ) from exc
+    status_url = f"/payments/{payment.id}"
+    response.headers["Location"] = status_url
     return PaymentAccepted(
-        payment_id=payment.id, status=payment.status,
-        message="Payment accepted for asynchronous processing",
+        payment_id=payment.id, status=payment.status, status_url=status_url,
+        message="Payment accepted for asynchronous processing. Poll status_url for the result.",
     )
 
 
