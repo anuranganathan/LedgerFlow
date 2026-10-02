@@ -23,9 +23,10 @@ from sqlalchemy.orm import Session
 
 import aws_services
 from database import SessionLocal
+import webhooks
 from models import (
-    Account, EntryType, IdempotencyKey, LedgerEntry, OutboxEvent, Payment, PaymentStatus, RefreshToken,
-    Refund, RefundStatus,
+    Account, DeliveryStatus, EntryType, IdempotencyKey, LedgerEntry, OutboxEvent, Payment, PaymentStatus, RefreshToken,
+    Refund, RefundStatus, WebhookDelivery,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -167,10 +168,25 @@ def delete_expired_rows(db: Session) -> int:
     return deleted
 
 
+def queue_forgotten_webhooks(db: Session) -> int:
+    """Queues webhook deliveries saved but never put on SQS (e.g. SQS was down during a retry)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=1)
+    deliveries = db.scalars(select(WebhookDelivery).where(
+        WebhookDelivery.status == DeliveryStatus.PENDING, WebhookDelivery.enqueued_at.is_(None),
+        WebhookDelivery.created_at < cutoff,
+    ).limit(100)).all()
+    for delivery in deliveries:
+        webhooks.queue(db, delivery)
+    return len(deliveries)
+
+
 def run_once() -> dict:
     with SessionLocal() as db:
         report = run_checks(db)
         deleted = delete_expired_rows(db)
+        requeued = queue_forgotten_webhooks(db)
+    if requeued:
+        logger.warning("Queued %d webhook deliveries that were never queued", requeued)
     stuck = report["stuck_payments"] + report["stuck_refunds"] + report["stale_outbox_events"]
     aws_services.put_metric("LedgerMismatches", report["ledger_problems"])
     aws_services.put_metric("StuckItems", stuck)

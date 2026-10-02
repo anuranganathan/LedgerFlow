@@ -16,6 +16,7 @@
       <div class="muted">Event-driven payment processing: FastAPI, Kafka, PostgreSQL, Redis, AWS S3, SQS and CloudWatch</div>
     </div>
     <div class="row">
+      <span id="live" class="muted" hidden title="Updates arrive instantly over Server-Sent Events">● Live</span>
       <span id="whoami" class="muted"></span>
       <button class="secondary" id="switch-demo" hidden></button>
       <button class="secondary" id="logout" hidden>Log out</button>
@@ -73,6 +74,20 @@
         <label>Description <input id="description" value="Demo purchase" maxlength="200"></label>
         <button type="submit">Pay</button>
       </form>
+    </section>
+
+    <section class="card" id="webhook-card" hidden>
+      <h2>Webhooks</h2>
+      <div class="muted">LedgerFlow POSTs signed payment and refund events to your server.</div>
+      <form id="webhook-form" class="row" style="margin-top:10px">
+        <input id="webhook-url" type="url" placeholder="https://your-shop.example/ledgerflow" style="flex:1" required aria-label="Webhook URL">
+        <button type="submit" class="secondary">Save</button>
+      </form>
+      <div id="webhook-secret"></div>
+      <div class="scroll"><table>
+        <thead><tr><th>Event</th><th>Status</th><th class="num">Attempts</th><th>Last result</th><th></th></tr></thead>
+        <tbody id="webhook-deliveries"></tbody>
+      </table></div>
     </section>
 
     <section class="card" id="reconciliation-card" hidden>

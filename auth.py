@@ -114,7 +114,7 @@ def revoke_all_sessions(db: Session, user_id: uuid.UUID) -> None:
     ).values(revoked_at=datetime.now(timezone.utc)))
 
 
-def current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+def user_for_token(db: Session, token: str) -> User:
     unauthorized = HTTPException(
         status.HTTP_401_UNAUTHORIZED, "Not logged in or session expired",
         headers={"WWW-Authenticate": "Bearer"},
@@ -129,6 +129,10 @@ def current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_
     if user is None:
         raise unauthorized
     return user
+
+
+def current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+    return user_for_token(db, token)
 
 
 def require_role(*roles: UserRole):

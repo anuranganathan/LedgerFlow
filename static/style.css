@@ -53,3 +53,4 @@ pre { background: var(--bg); padding: 10px; border-radius: 6px; overflow-x: auto
 .balance { font-size: 26px; font-weight: 600; margin: 4px 0 12px; font-variant-numeric: tabular-nums; }
 .ok-text { color: var(--ok); }
 .bad-text { color: var(--bad); }
+#live { color: var(--ok); font-weight: 600; }

@@ -5,7 +5,8 @@ from decimal import Decimal
 from typing import Annotated
 
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, or_, select, text, true
@@ -14,20 +15,23 @@ from sqlalchemy.orm import Session
 
 import auth
 import aws_services
+import events
 import idempotency
 import ledger
 import reconcile
 import redis_client
-from database import get_db
+import webhooks
+from database import SessionLocal, get_db
 from models import (
-    Account, AccountType, LedgerEntry, Notification, Payment, PaymentStatus, Refund, RefundStatus,
-    TopUp, User, UserRole,
+    Account, AccountType, DeliveryStatus, LedgerEntry, Notification, Payment, PaymentStatus, Refund,
+    RefundStatus, TopUp, User, UserRole, WebhookDelivery, WebhookEndpoint,
 )
 from outbox import add_payment_event
 from schemas import (
     AccountCreate, AccountResponse, FundRequest, LedgerResponse, MeResponse, MerchantResponse,
     NotificationResponse, Page, PaymentAccepted, PaymentCreate, PaymentResponse, RefundCreate,
-    RefundResponse, RegisterRequest, TokenResponse, UserResponse,
+    RefundResponse, RegisterRequest, TokenResponse, UserResponse, WebhookDeliveryResponse,
+    WebhookEndpointRequest, WebhookEndpointResponse, WebhookSecretResponse,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -434,3 +438,130 @@ def run_reconciliation(
 ) -> dict:
     """Checks that the ledger balances (admins only). Also run every few minutes by reconcile.py."""
     return reconcile.run_checks(db)
+
+
+# ---------- Live updates ----------
+
+@app.get("/events", tags=["live updates"])
+async def live_events(request: Request, token: Annotated[str, Depends(auth.oauth2_scheme)]):
+    """Server-Sent Events: an `update` event whenever one of your payments or refunds changes.
+
+    The stream ends after 10 minutes; reconnect with a current access token.
+    """
+    def load_user() -> uuid.UUID:
+        # A short session, so the open stream doesn't hold a database connection.
+        with SessionLocal() as db:
+            return auth.user_for_token(db, token).id
+
+    user_id = await run_in_threadpool(load_user)
+    return StreamingResponse(
+        events.stream(user_id, request.is_disconnected), media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------- Merchant webhooks ----------
+
+def merchant_account_for(db: Session, account_id: uuid.UUID, user: User) -> Account:
+    account = get_account_for(db, account_id, user)
+    if account.account_type != AccountType.MERCHANT:
+        raise HTTPException(400, "Webhooks are for merchant accounts")
+    return account
+
+
+def endpoint_for(db: Session, account_id: uuid.UUID) -> WebhookEndpoint | None:
+    return db.scalar(select(WebhookEndpoint).where(WebhookEndpoint.account_id == account_id))
+
+
+def validate_webhook_url(url: str) -> None:
+    try:
+        webhooks.resolve(url)
+    except webhooks.InvalidWebhookUrl as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/accounts/{account_id}/webhook-endpoint", response_model=WebhookEndpointResponse, tags=["webhooks"])
+def get_webhook_endpoint(account_id: uuid.UUID, user: CurrentUser, db: Session = Depends(get_db)):
+    merchant_account_for(db, account_id, user)
+    endpoint = endpoint_for(db, account_id)
+    if endpoint is None:
+        raise HTTPException(404, "No webhook endpoint")
+    return endpoint
+
+
+@app.put("/accounts/{account_id}/webhook-endpoint", tags=["webhooks"],
+         response_model=WebhookSecretResponse | WebhookEndpointResponse)
+def set_webhook_endpoint(
+    account_id: uuid.UUID, data: WebhookEndpointRequest, user: CurrentUser, db: Session = Depends(get_db)
+):
+    """Sets the URL that receives this merchant's events. The signing secret is returned the first
+    time; keep it to verify the LedgerFlow-Signature header."""
+    merchant_account_for(db, account_id, user)
+    validate_webhook_url(data.url)
+    endpoint = endpoint_for(db, account_id)
+    if endpoint is None:
+        endpoint = WebhookEndpoint(account_id=account_id, url=data.url, secret=webhooks.new_secret(), enabled=True)
+        db.add(endpoint)
+        db.commit()
+        return WebhookSecretResponse.model_validate(endpoint)
+    endpoint.url, endpoint.enabled = data.url, True
+    db.commit()
+    return WebhookEndpointResponse.model_validate(endpoint)
+
+
+@app.post("/accounts/{account_id}/webhook-endpoint/rotate-secret", response_model=WebhookSecretResponse,
+          tags=["webhooks"])
+def rotate_webhook_secret(account_id: uuid.UUID, user: CurrentUser, db: Session = Depends(get_db)):
+    merchant_account_for(db, account_id, user)
+    endpoint = endpoint_for(db, account_id)
+    if endpoint is None:
+        raise HTTPException(404, "No webhook endpoint")
+    endpoint.secret = webhooks.new_secret()
+    db.commit()
+    return endpoint
+
+
+@app.delete("/accounts/{account_id}/webhook-endpoint", status_code=204, tags=["webhooks"])
+def disable_webhook_endpoint(account_id: uuid.UUID, user: CurrentUser, db: Session = Depends(get_db)):
+    """Stops sending events. Delivery history is kept."""
+    merchant_account_for(db, account_id, user)
+    endpoint = endpoint_for(db, account_id)
+    if endpoint is not None:
+        endpoint.enabled = False
+        db.commit()
+    return Response(status_code=204)
+
+
+@app.get("/accounts/{account_id}/webhook-deliveries", response_model=list[WebhookDeliveryResponse],
+         tags=["webhooks"])
+def list_webhook_deliveries(
+    account_id: uuid.UUID, user: CurrentUser, page: PageQuery, db: Session = Depends(get_db)
+):
+    merchant_account_for(db, account_id, user)
+    query = (select(WebhookDelivery).join(WebhookEndpoint, WebhookEndpoint.id == WebhookDelivery.endpoint_id)
+             .where(WebhookEndpoint.account_id == account_id)
+             .order_by(WebhookDelivery.created_at.desc(), WebhookDelivery.id))
+    return db.scalars(paginate(query, page)).all()
+
+
+@app.post("/webhook-deliveries/{delivery_id}/retry", response_model=WebhookDeliveryResponse, status_code=202,
+          tags=["webhooks"])
+def retry_webhook_delivery(delivery_id: uuid.UUID, user: CurrentUser, db: Session = Depends(get_db)):
+    """Sends a failed delivery again (for example after fixing your endpoint)."""
+    delivery = db.get(WebhookDelivery, delivery_id)
+    endpoint = db.get(WebhookEndpoint, delivery.endpoint_id) if delivery else None
+    if endpoint is None:
+        raise HTTPException(404, "Delivery not found")
+    merchant_account_for(db, endpoint.account_id, user)
+    if delivery.status != DeliveryStatus.FAILED:
+        raise HTTPException(409, "Only failed deliveries can be retried")
+    if not endpoint.enabled:
+        raise HTTPException(409, "The webhook endpoint is disabled")
+    delivery.status, delivery.attempts, delivery.enqueued_at = DeliveryStatus.PENDING, 0, None
+    db.commit()
+    try:
+        webhooks.queue(db, delivery)
+    except Exception:
+        # Saved as PENDING and not queued: the reconciler queues it within a few minutes.
+        logging.exception("Could not queue webhook delivery %s now", delivery.id)
+    return delivery

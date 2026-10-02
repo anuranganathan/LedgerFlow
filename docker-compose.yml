@@ -22,6 +22,8 @@ services:
       # Local development only; production gets a random secret (see deploy.sh).
       JWT_SECRET: ${JWT_SECRET:-local-development-jwt-secret-not-for-production}
       COOKIE_SECURE: "false"
+      # Local development only: lets webhook URLs use http and other containers' addresses.
+      WEBHOOK_ALLOW_INSECURE_URLS: "true"
     depends_on: &app-dependencies
       postgres:
         condition: service_healthy
@@ -62,6 +64,27 @@ services:
       - .:/app
     environment: *app-environment
     depends_on: *app-dependencies
+
+  # Delivers signed webhook events to merchants' servers.
+  webhooks:
+    build: .
+    command: python webhooks.py
+    restart: on-failure
+    volumes:
+      - .:/app
+    environment: *app-environment
+    depends_on: *app-dependencies
+
+  # An example merchant server for trying webhooks locally (docker compose --profile demo up).
+  # Register http://webhook-receiver:9000/ as the webhook URL and set WEBHOOK_SECRET in .env.
+  webhook-receiver:
+    build: .
+    command: python examples/webhook_receiver.py
+    profiles: ["demo"]
+    volumes:
+      - .:/app
+    environment:
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
 
   # Checks that the ledger balances every 5 minutes and reports to CloudWatch.
   reconciler:
