@@ -14,12 +14,14 @@ logger = logging.getLogger(__name__)
 
 def handle_message(message: dict) -> None:
     event = message["body"]
-    send_slack_message(format_payment_message(event))
     with SessionLocal() as db:
         notification = db.get(Notification, uuid.UUID(event["notification_id"]))
-        if notification:
-            notification.status = NotificationStatus.SENT
-            db.commit()
+        # SQS can deliver a message more than once, so skip ones that were already sent.
+        if notification is None or notification.status != NotificationStatus.SENT:
+            send_slack_message(format_payment_message(event))
+            if notification is not None:
+                notification.status = NotificationStatus.SENT
+                db.commit()
     # Delete only after Slack accepted it. If Slack is down the message stays in SQS,
     # is retried, and after 3 failed attempts SQS moves it to the dead-letter queue.
     aws_services.delete_notification(message["receipt_handle"])

@@ -28,10 +28,24 @@ services:
         condition: service_healthy
       aws-setup:
         condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
 
+  # Publishes events from the outbox table to Kafka.
+  relay:
+    build: .
+    command: python relay.py
+    restart: on-failure
+    volumes:
+      - .:/app
+    environment: *app-environment
+    depends_on: *app-dependencies
+
+  # Scale with: docker compose up --scale worker=3 (the topic has 3 partitions).
   worker:
     build: .
     command: python worker.py
+    restart: on-failure
     volumes:
       - .:/app
     environment: *app-environment
@@ -40,10 +54,22 @@ services:
   notifier:
     build: .
     command: python notifier.py
+    restart: on-failure
     volumes:
       - .:/app
     environment: *app-environment
     depends_on: *app-dependencies
+
+  # Applies database migrations once, then exits.
+  migrate:
+    build: .
+    command: alembic upgrade head
+    volumes:
+      - .:/app
+    environment: *app-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   # Runs setup_aws.py once to create the bucket, queues and CloudWatch alarm, then exits.
   aws-setup:

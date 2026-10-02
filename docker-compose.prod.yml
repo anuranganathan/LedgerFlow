@@ -21,8 +21,27 @@ x-app: &app
       condition: service_healthy
     kafka:
       condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
 
 services:
+  # Applies database migrations once per deploy, then exits.
+  migrate:
+    build: .
+    command: alembic upgrade head
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://payflow:${POSTGRES_PASSWORD}@postgres:5432/payflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /ledgerflow/app
+        awslogs-stream: migrate
+
   api:
     <<: *app
     command: uvicorn app:app --host 0.0.0.0 --port 8000
@@ -34,6 +53,16 @@ services:
         awslogs-region: ${AWS_REGION}
         awslogs-group: /ledgerflow/app
         awslogs-stream: api
+
+  relay:
+    <<: *app
+    command: python relay.py
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /ledgerflow/app
+        awslogs-stream: relay
 
   worker:
     <<: *app

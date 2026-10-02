@@ -85,6 +85,21 @@ def create_monitoring() -> None:
     )
     print("CloudWatch alarm ledgerflow-failed-payments ready")
 
+    # Any event in the Kafka dead-letter topic needs a person to look at it.
+    client("cloudwatch").put_metric_alarm(
+        AlarmName="ledgerflow-dead-lettered-events",
+        Namespace=METRICS_NAMESPACE,
+        MetricName="PaymentEventsDeadLettered",
+        Statistic="Sum",
+        Period=300,
+        EvaluationPeriods=1,
+        Threshold=1,
+        ComparisonOperator="GreaterThanOrEqualToThreshold",
+        TreatMissingData="notBreaching",
+        AlarmActions=[topic_arn],
+    )
+    print("CloudWatch alarm ledgerflow-dead-lettered-events ready")
+
 
 if __name__ == "__main__":
     create_bucket()

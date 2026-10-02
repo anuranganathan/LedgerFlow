@@ -1,6 +1,6 @@
 # LedgerFlow — Event-Driven Payment Processing on AWS
 
-LedgerFlow is an event-driven payment processing system built with a focus on reliability, asynchronous processing and cloud integration. A REST API accepts payments, Kafka hands them to a background worker, and the worker moves money with a double-entry ledger. Receipts go to Amazon S3, notifications flow through Amazon SQS to Slack, and metrics and logs go to Amazon CloudWatch. A Jenkins pipeline tests, builds and deploys it to AWS EC2.
+LedgerFlow is an event-driven payment processing system built with a focus on reliability, asynchronous processing and cloud integration. A REST API accepts payments, a transactional outbox and Kafka hand them to a background worker, and the worker moves money with a double-entry ledger. Receipts go to Amazon S3, notifications flow through Amazon SQS to Slack, and metrics and logs go to Amazon CloudWatch. A Jenkins pipeline tests, builds and deploys it to AWS EC2.
 
 **Live demo:** <http://52.66.120.13> · **API docs:** <http://52.66.120.13/docs> (hosted on AWS EC2, ap-south-1)
 
@@ -11,10 +11,12 @@ LedgerFlow is an event-driven payment processing system built with a focus on re
 ```mermaid
 flowchart LR
     Client[Dashboard / REST client] --> API[FastAPI]
-    API --> DB[(PostgreSQL)]
+    API -- payment + outbox event<br/>in one transaction --> DB[(PostgreSQL)]
     API --> Cache[(Redis)]
-    API -- PAYMENT_CREATED --> Kafka[[Kafka]]
+    DB --> Relay[Outbox relay]
+    Relay -- PAYMENT_CREATED --> Kafka[[Kafka]]
     Kafka --> Worker[Payment worker]
+    Worker -. after 3 failed attempts .-> KDLQ[[Kafka dead-letter topic]]
     Worker --> DB
     Worker -- receipt --> S3[(Amazon S3)]
     Worker -- event --> SQS[[Amazon SQS]]
@@ -27,20 +29,35 @@ flowchart LR
 
 **What happens to one payment**
 
-1. `POST /payments` validates the request, saves the payment as `PENDING` in PostgreSQL and publishes a `PAYMENT_CREATED` event to Kafka. The API returns `202 Accepted` right away.
-2. The **worker** consumes the event, locks the rows, checks the balance and writes two ledger entries (DEBIT the customer, CREDIT the merchant) in one database transaction.
-3. For a successful payment, the worker stores a JSON **receipt in S3**.
-4. The worker sends an event to **SQS** and publishes `PaymentsSucceeded` / `PaymentsFailed` and processing-time **metrics to CloudWatch**.
+1. `POST /payments` validates the request and saves the payment as `PENDING` **and** a `PAYMENT_CREATED` event in the `outbox_events` table, in one database transaction. It returns `202 Accepted` with a `status_url` (also in the `Location` header) that the client polls for the result.
+2. The **relay** publishes outbox events to Kafka and marks them as published. If Kafka is down, events wait in PostgreSQL and are sent when it's back.
+3. The **worker** consumes the event, locks the payment and both account rows, checks the balance and writes two ledger entries (DEBIT the customer, CREDIT the merchant) in one database transaction. It commits the Kafka offset only after the event is fully handled.
+4. The worker queues a notification on **SQS**, stores a JSON **receipt in S3** for a successful payment, and publishes `PaymentsSucceeded` / `PaymentsFailed` and end-to-end processing-time **metrics to CloudWatch**.
 5. The **notifier** reads SQS and posts the result to **Slack**. It deletes the message only after Slack accepts it, so if Slack is down the message is retried. After 3 failed attempts it moves to a **dead-letter queue**.
 6. A **CloudWatch alarm** fires when 3 or more payments fail within 5 minutes.
+
+## Delivery guarantees
+
+Every step can crash or find a dependency down, so each hand-off is designed to never lose a payment and never move money twice:
+
+| Step | Guarantee | How |
+|---|---|---|
+| API → Kafka | No lost events | **Transactional outbox**: the payment and its event are committed together; `relay.py` publishes the event later. The API never returns an error because Kafka is down. |
+| Kafka → worker | At-least-once | Auto-commit is off. The worker commits each offset only **after** handling the event, so a crash means redelivery, not loss. |
+| Worker | Exactly-once money movement | The worker locks the payment row, re-reads its status, and skips settlement if it's already final. Account rows are locked in ID order (no deadlocks), so concurrent payments can't overdraw an account and a top-up can't overwrite a payment. |
+| Worker side effects | Completed eventually, never duplicated | The SQS notification and S3 receipt are only created if missing. If one fails, the event is retried and only the missing step is redone. |
+| Failing events | Never block the queue | 3 attempts with exponential backoff, then the event goes to the `payment-events-dlq` topic (CloudWatch alarm). Malformed messages go there straight away. After fixing the cause, `python replay_dlq.py --replay` sends them back safely. |
+| SQS → Slack | At-least-once, duplicates skipped | The message is deleted only after Slack accepts it, and a notification already marked `SENT` isn't posted again. |
+
+These are covered by tests, including concurrency tests on real PostgreSQL (`tests_postgres.py`).
 
 ## Tech stack
 
 | Area | Tools | Used for |
 |---|---|---|
 | Backend | Python, FastAPI, SQLAlchemy, Pydantic | REST API, validation, data models |
-| Database / cache | PostgreSQL, Redis | Source of truth; short-lived payment status cache |
-| Messaging | Kafka, Amazon SQS | Kafka for payment events, SQS for notifications |
+| Database / cache | PostgreSQL, Alembic, Redis | Source of truth; schema migrations; short-lived payment status cache |
+| Messaging | Kafka, Amazon SQS | Kafka for payment events (outbox relay, dead-letter topic), SQS for notifications |
 | AWS | boto3, S3, SQS, CloudWatch (metrics, logs, alarms), SNS, IAM, EC2 | Storage, queues, monitoring, hosting |
 | DevOps | Docker, Docker Compose, Jenkins, LocalStack | Containers, CI/CD, local AWS |
 | Integrations | Slack incoming webhooks | Payment alerts in a channel |
@@ -72,9 +89,11 @@ No AWS resources are created by hand; two scripts create them:
 | Signal | Where |
 |---|---|
 | `PaymentsSucceeded`, `PaymentsFailed`, `NotificationsFailed` | CloudWatch metrics, namespace `LedgerFlow` |
-| `PaymentProcessingTime` (ms) | CloudWatch metric |
+| `PaymentEventsDeadLettered`, `OutboxPublishFailures` | CloudWatch metrics |
+| `PaymentProcessingTime` (ms, from request to settlement) | CloudWatch metric |
 | API, worker and notifier logs | CloudWatch Logs group `/ledgerflow/app` (Docker `awslogs` driver) |
 | 3+ failed payments in 5 minutes | CloudWatch alarm → SNS topic `ledgerflow-alerts` |
+| Any event dead-lettered | CloudWatch alarm → SNS topic `ledgerflow-alerts` |
 | Is the app up? | `GET /health` (checks the database), used by `deploy.sh` |
 
 ### Security
@@ -95,7 +114,17 @@ docker compose up --build
 
 Open <http://localhost:8000> and click **Create demo accounts**, then send a payment. Try an amount larger than the balance to see a `FAILED` payment. Swagger UI is at <http://localhost:8000/docs>.
 
-Everything runs locally, including AWS: LocalStack emulates S3, SQS, CloudWatch and SNS, and `setup_aws.py` provisions them on startup. Without a Slack webhook, the notifier logs the Slack message instead (`docker compose logs notifier`).
+Everything runs locally, including AWS: LocalStack emulates S3, SQS, CloudWatch and SNS, and `setup_aws.py` provisions them on startup. The `migrate` service applies database migrations before the app starts. If port 8000 is taken, run `API_PORT=8001 docker compose up --build`. Without a Slack webhook, the notifier logs the Slack message instead (`docker compose logs notifier`).
+
+### Database migrations
+
+The schema is managed by **Alembic** (`migrations/`). The `migrate` service runs `alembic upgrade head` on every start and deploy. To change the schema, edit `models.py`, then:
+
+```bash
+docker compose run --rm migrate alembic revision --autogenerate -m "describe the change"
+```
+
+A test checks that the migrations produce exactly the schema in `models.py`.
 
 ### Tests
 
@@ -104,10 +133,21 @@ pip install -r requirements-dev.txt
 pytest -q tests.py
 ```
 
-The tests use SQLite and **moto**, an in-memory mock of AWS, so they need no Docker or AWS account. They cover:
+The tests use SQLite and **moto**, an in-memory mock of AWS, so they need no Docker or AWS account. `tests_postgres.py` covers what SQLite can't (row locks under concurrency and migrating an existing database); it needs PostgreSQL:
+
+```bash
+docker run -d --rm --name ledgerflow-test-db -p 55432:5432 \
+  -e POSTGRES_USER=test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=test postgres:16-alpine
+TEST_DATABASE_URL=postgresql+psycopg2://test:test@localhost:55432/test pytest -q tests_postgres.py
+```
+
+The tests cover:
 
 - account and payment APIs
 - successful and failed payments and the double-entry ledger
+- the outbox and relay (including Kafka being down), offset commits, retries and the dead-letter topic
+- duplicate events and crash recovery, without moving money twice
+- concurrent payments and top-ups on PostgreSQL
 - Redis fallback
 - S3 receipts, SQS messages and CloudWatch metrics
 - Slack delivery, including retries when Slack is down
@@ -143,10 +183,13 @@ Reason: Insufficient balance
 | Failure | Behaviour |
 |---|---|
 | Insufficient balance | Payment becomes `FAILED`, no balance changes, metric + Slack alert |
-| Kafka down when creating a payment | API returns `503`; the payment stays saved as `PENDING` |
-| Same Kafka event delivered twice | Ignored once the payment is `SUCCESS`/`FAILED` |
+| Kafka down when creating a payment | API still returns `202`; the event waits in the outbox and the relay publishes it when Kafka is back |
+| Worker crashes mid-payment | Offset wasn't committed, so Kafka redelivers the event; the money transaction either fully happened or not at all |
+| Same Kafka event delivered twice | Money moves once; missing side effects are completed, existing ones aren't repeated |
+| Event keeps failing | 3 attempts with backoff, then the Kafka dead-letter topic + CloudWatch alarm; replay with `replay_dlq.py` |
+| Malformed event | Sent straight to the dead-letter topic instead of crashing the worker |
 | Redis down | Logged; reads fall back to PostgreSQL |
-| S3 or SQS down | Logged; the committed payment is not rolled back |
+| S3 or SQS down | The committed payment is kept; the event is retried and then dead-lettered, and replaying it finishes only the missing receipt/notification |
 | Slack down | Message stays in SQS and is retried, then moves to the dead-letter queue |
 | CloudWatch down | Metric is skipped; payment processing continues |
 
@@ -154,9 +197,13 @@ Reason: Insufficient balance
 
 ```text
 app.py               FastAPI app and endpoints
-worker.py            Kafka consumer that processes payments
+outbox.py            Writes events to the outbox table
+relay.py             Publishes outbox events to Kafka
+worker.py            Kafka consumer that processes payments (retries, dead-letter topic)
+replay_dlq.py        Lists or replays dead-lettered events
 notifier.py          SQS consumer that sends Slack messages
-models.py            SQLAlchemy tables: accounts, payments, ledger_entries, notifications
+models.py            SQLAlchemy tables: accounts, payments, ledger_entries, notifications, outbox_events
+migrations/          Alembic database migrations
 schemas.py           Pydantic request/response models
 database.py          Database engine and sessions
 kafka_client.py      Kafka producer/consumer
@@ -167,7 +214,8 @@ setup_aws.py         Creates S3 / SQS / CloudWatch / SNS resources
 provision_ec2.py     Creates IAM role, security group and EC2 server
 deploy.sh            Deploy script run on the server
 static/index.html    Dashboard
-tests.py             pytest suite
+tests.py             pytest suite (SQLite + moto)
+tests_postgres.py    Concurrency and migration tests on PostgreSQL
 Jenkinsfile          CI/CD pipeline
 jenkins/             Jenkins in Docker
 docker-compose.yml       Local stack (with LocalStack)
