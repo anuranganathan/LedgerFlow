@@ -84,6 +84,16 @@ services:
         awslogs-group: /ledgerflow/app
         awslogs-stream: notifier
 
+  reconciler:
+    <<: *app
+    command: python reconcile.py
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /ledgerflow/app
+        awslogs-stream: reconciler
+
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped

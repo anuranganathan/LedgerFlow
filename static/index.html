@@ -66,7 +66,7 @@
     <div class="row"><a href="/docs">API docs (Swagger)</a><a href="https://github.com/anuranganathan/LedgerFlow">GitHub</a></div>
   </header>
 
-  <div class="flow">POST /payments → PostgreSQL (PENDING) → Kafka → worker → double-entry ledger → S3 receipt → SQS → notifier → Slack &nbsp;|&nbsp; metrics → CloudWatch</div>
+  <div class="flow">POST /payments → PostgreSQL (payment + outbox event) → relay → Kafka → worker → double-entry ledger → SQS → notifier → Slack &nbsp;|&nbsp; S3 receipt &nbsp;|&nbsp; metrics → CloudWatch</div>
 
   <div class="grid">
     <section class="card">
@@ -95,7 +95,7 @@
     <section class="card wide">
       <h2>Payments <span class="muted" style="font-weight:400">(click a row for its ledger entries and S3 receipt)</span></h2>
       <div class="scroll"><table>
-        <thead><tr><th>Payment ID</th><th>Description</th><th class="num">Amount</th><th>Status</th><th>Reason</th><th>Created</th></tr></thead>
+        <thead><tr><th>Payment ID</th><th>Description</th><th class="num">Amount</th><th class="num">Refunded</th><th>Status</th><th>Reason</th><th>Created</th></tr></thead>
         <tbody id="payments"></tbody>
       </table></div>
       <div id="details"></div>
@@ -141,24 +141,37 @@ async function loadPayments() {
       <td class="mono">${p.id.slice(0, 8)}</td>
       <td>${escapeHtml(p.description)}</td>
       <td class="num">₹${p.amount}</td>
+      <td class="num">${Number(p.refunded_amount) ? "₹" + p.refunded_amount : ""}</td>
       <td><span class="badge ${p.status}">${p.status}</span></td>
       <td>${escapeHtml(p.failure_reason)}</td>
       <td class="muted">${new Date(p.created_at).toLocaleTimeString()}</td>
     </tr>`).join("")
-    : `<tr><td colspan="6" class="empty">No payments yet.</td></tr>`;
+    : `<tr><td colspan="7" class="empty">No payments yet.</td></tr>`;
 }
 
 async function showDetails(paymentId) {
+  const payment = await api(`/payments/${paymentId}`);
   const ledger = await api(`/payments/${paymentId}/ledger`);
+  const refunds = await api(`/payments/${paymentId}/refunds`);
   const receipt = await api(`/payments/${paymentId}/receipt`).catch(() => null);
   const names = Object.fromEntries(accounts.map((a) => [a.id, a.name]));
+  const refundable = payment.status === "SUCCESS" && Number(payment.refunded_amount) < Number(payment.amount);
   $("details").innerHTML = `
     <h2 style="margin-top:20px">Payment <span class="mono">${paymentId}</span></h2>
     ${ledger.length ? `<table>
-      <thead><tr><th>Ledger entry</th><th>Account</th><th class="num">Amount</th></tr></thead>
-      <tbody>${ledger.map((e) => `<tr><td>${e.entry_type}</td><td>${escapeHtml(names[e.account_id])}</td><td class="num">₹${e.amount}</td></tr>`).join("")}</tbody>
-    </table>` : `<div class="empty">No ledger entries: the payment failed, so no money moved.</div>`}
+      <thead><tr><th>Ledger entry</th><th>Account</th><th>For</th><th class="num">Amount</th></tr></thead>
+      <tbody>${ledger.map((e) => `<tr><td>${e.entry_type}</td><td>${escapeHtml(names[e.account_id])}</td><td>${e.refund_id ? "Refund" : "Payment"}</td><td class="num">₹${e.amount}</td></tr>`).join("")}</tbody>
+    </table>` : `<div class="empty">No ledger entries: the payment ${payment.status === "PENDING" ? "is still pending" : "failed, so no money moved"}.</div>`}
+    ${refunds.length ? `<div class="muted" style="margin-top:12px">Refunds</div><table><tbody>${refunds.map((r) => `<tr><td class="mono">${r.id.slice(0, 8)}</td><td class="num">₹${r.amount}</td><td><span class="badge ${r.status}">${r.status}</span></td><td>${escapeHtml(r.failure_reason || r.reason)}</td></tr>`).join("")}</tbody></table>` : ""}
+    ${refundable ? `<div class="row" style="margin-top:12px"><button class="secondary" id="refund">Refund the rest (₹${(Number(payment.amount) - Number(payment.refunded_amount)).toFixed(2)})</button></div>` : ""}
     ${receipt ? `<div class="muted" style="margin-top:12px">Receipt stored in S3:</div><pre>${escapeHtml(JSON.stringify(receipt, null, 2))}</pre>` : ""}`;
+  if (refundable) $("refund").addEventListener("click", async () => {
+    try {
+      await api(`/payments/${paymentId}/refunds`, {method: "POST", body: JSON.stringify({reason: "Refund from dashboard"})});
+      $("message").textContent = "Refund accepted. The worker is processing it...";
+      setTimeout(() => showDetails(paymentId), 1500);
+    } catch (error) { $("message").textContent = `Refund rejected: ${error.message}`; }
+  });
 }
 
 async function refresh() {

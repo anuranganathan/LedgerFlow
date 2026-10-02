@@ -9,11 +9,11 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 
 def format_payment_message(event: dict[str, str]) -> str:
     icon = ":white_check_mark:" if event["status"] == "SUCCESS" else ":x:"
-    lines = [
-        f"{icon} *Payment {event['status']}*",
-        f"Payment ID: `{event['payment_id']}`",
-        f"Amount: {event['amount']} {event['currency']}",
-    ]
+    kind = "Refund" if event.get("kind") == "REFUND" else "Payment"
+    lines = [f"{icon} *{kind} {event['status']}*", f"Payment ID: `{event['payment_id']}`"]
+    if event.get("refund_id"):
+        lines.append(f"Refund ID: `{event['refund_id']}`")
+    lines.append(f"Amount: {event['amount']} {event['currency']}")
     if event.get("reason"):
         lines.append(f"Reason: {event['reason']}")
     return "\n".join(lines)
