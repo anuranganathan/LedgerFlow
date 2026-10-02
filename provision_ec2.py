@@ -8,9 +8,11 @@ Needs AWS credentials on your laptop (for example from `aws configure`).
 What it creates:
   - S3 bucket, SQS queues and CloudWatch alarm (via setup_aws.py)
   - IAM role for the server with only the permissions the app needs
-  - SSH key pair and a security group (HTTP open, SSH only from your current IP)
+  - an ECR repository for the images Jenkins builds (one tag per git commit)
+  - SSH key pair and a security group (HTTP/HTTPS open, SSH only from your current IP)
   - one EC2 instance (Amazon Linux 2023) with a fixed Elastic IP
-The server installs Docker on first boot, clones the repo and runs deploy.sh.
+The server installs Docker on first boot, clones the repo and runs deploy.sh. It is served over
+HTTPS at <ip-with-dashes>.sslip.io (a free DNS name for the IP; Caddy gets the certificate).
 """
 import json
 import secrets
@@ -36,6 +38,7 @@ iam = boto3.client("iam")
 ACCOUNT_ID = boto3.client("sts").get_caller_identity()["Account"]
 # S3 bucket names are global across all AWS accounts, so the account ID keeps ours unique.
 BUCKET = f"{NAME}-receipts-{ACCOUNT_ID}"
+ECR_REPOSITORY = f"{ACCOUNT_ID}.dkr.ecr.{AWS_REGION}.amazonaws.com/{NAME}"
 
 
 def create_iam_role() -> None:
@@ -60,6 +63,11 @@ def create_iam_role() -> None:
              "Condition": {"StringEquals": {"cloudwatch:namespace": METRICS_NAMESPACE}}},
             {"Effect": "Allow", "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
              "Resource": f"arn:aws:logs:{AWS_REGION}:{ACCOUNT_ID}:log-group:{setup_aws.LOG_GROUP}:*"},
+            # Pull (not push) the images Jenkins built.
+            {"Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*"},
+            {"Effect": "Allow",
+             "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability"],
+             "Resource": f"arn:aws:ecr:{AWS_REGION}:{ACCOUNT_ID}:repository/{NAME}"},
         ],
     }
     role = f"{NAME}-ec2-role"
@@ -71,6 +79,22 @@ def create_iam_role() -> None:
         pass
     iam.put_role_policy(RoleName=role, PolicyName=f"{NAME}-app", PolicyDocument=json.dumps(permissions))
     print(f"IAM role {role} ready")
+
+
+def create_ecr_repository() -> None:
+    ecr = boto3.client("ecr", region_name=AWS_REGION)
+    try:
+        ecr.create_repository(repositoryName=NAME, imageScanningConfiguration={"scanOnPush": True},
+                              imageTagMutability="IMMUTABLE")
+    except ecr.exceptions.RepositoryAlreadyExistsException:
+        pass
+    # Keep the last 30 images: enough to roll back, without paying to store every build.
+    ecr.put_lifecycle_policy(repositoryName=NAME, lifecyclePolicyText=json.dumps({"rules": [{
+        "rulePriority": 1, "description": "Keep the last 30 images",
+        "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 30},
+        "action": {"type": "expire"},
+    }]}))
+    print(f"ECR repository {ECR_REPOSITORY} ready")
 
 
 def create_key_pair() -> None:
@@ -97,11 +121,11 @@ def create_security_group() -> str:
         group_id = existing[0]["GroupId"]
     else:
         group_id = ec2.create_security_group(
-            GroupName=f"{NAME}-sg", Description="LedgerFlow: HTTP from anywhere, SSH from admin IP",
+            GroupName=f"{NAME}-sg", Description="LedgerFlow: HTTP(S) from anywhere, SSH from admin IP",
             VpcId=vpc_id,
         )["GroupId"]
     my_ip = urllib.request.urlopen("https://checkip.amazonaws.com").read().decode().strip()
-    for port, cidr in [(80, "0.0.0.0/0"), (22, f"{my_ip}/32")]:
+    for port, cidr in [(80, "0.0.0.0/0"), (443, "0.0.0.0/0"), (22, f"{my_ip}/32")]:
         try:
             ec2.authorize_security_group_ingress(
                 GroupId=group_id, IpProtocol="tcp", FromPort=port, ToPort=port, CidrIp=cidr
@@ -113,7 +137,11 @@ def create_security_group() -> str:
     return group_id
 
 
-def user_data() -> str:
+def site_address(ip: str) -> str:
+    return f"{ip.replace('.', '-')}.sslip.io"
+
+
+def user_data(ip: str) -> str:
     """Shell script the server runs once on its first boot."""
     return f"""#!/bin/bash
 set -eux
@@ -137,6 +165,9 @@ AWS_REGION={AWS_REGION}
 S3_BUCKET={BUCKET}
 POSTGRES_PASSWORD={secrets.token_urlsafe(24)}
 JWT_SECRET={secrets.token_hex(32)}
+SITE_ADDRESS={site_address(ip)}
+COOKIE_SECURE=true
+ECR_REPOSITORY={ECR_REPOSITORY}
 SLACK_WEBHOOK_URL=
 EOF
 chown ec2-user:ec2-user /home/ec2-user/LedgerFlow/.env
@@ -158,7 +189,7 @@ def find_elastic_ip() -> dict | None:
     return addresses[0] if addresses else None
 
 
-def create_instance(group_id: str) -> str:
+def create_instance(group_id: str, ip: str) -> str:
     instance = find_instance()
     if instance:
         print(f"Server {instance['InstanceId']} already exists")
@@ -170,7 +201,7 @@ def create_instance(group_id: str) -> str:
                 ImageId=ami_id, InstanceType=INSTANCE_TYPE, MinCount=1, MaxCount=1,
                 KeyName=f"{NAME}-key", SecurityGroupIds=[group_id],
                 IamInstanceProfile={"Name": f"{NAME}-ec2-role"},
-                UserData=user_data(),
+                UserData=user_data(ip),
                 # IMDSv2 only; hop limit 2 lets containers reach the role credentials.
                 MetadataOptions={"HttpTokens": "required", "HttpPutResponseHopLimit": 2},
                 BlockDeviceMappings=[{"DeviceName": "/dev/xvda",
@@ -189,14 +220,14 @@ def create_instance(group_id: str) -> str:
     return instance["InstanceId"]
 
 
-def attach_elastic_ip(instance_id: str) -> str:
+def elastic_ip() -> dict:
+    """Allocated before the server starts, so its HTTPS hostname is known at first boot."""
     address = find_elastic_ip()
     if address is None:
         address = ec2.allocate_address(Domain="vpc", TagSpecifications=[
             {"ResourceType": "elastic-ip", "Tags": [{"Key": "Name", "Value": f"{NAME}-ip"}]}
         ])
-    ec2.associate_address(AllocationId=address["AllocationId"], InstanceId=instance_id)
-    return address["PublicIp"]
+    return address
 
 
 def provision() -> None:
@@ -205,14 +236,19 @@ def provision() -> None:
     setup_aws.create_queues()
     setup_aws.create_monitoring()
     create_iam_role()
+    create_ecr_repository()
     create_key_pair()
     group_id = create_security_group()
-    instance_id = create_instance(group_id)
-    ip = attach_elastic_ip(instance_id)
+    address = elastic_ip()
+    ip = address["PublicIp"]
+    instance_id = create_instance(group_id, ip)
+    ec2.associate_address(AllocationId=address["AllocationId"], InstanceId=instance_id)
     print(f"""
 Done. The first boot installs Docker and builds the app, which takes about 5-8 minutes.
-  App:       http://{ip}
-  API docs:  http://{ip}/docs
+  App:       https://{site_address(ip)}
+  API docs:  https://{site_address(ip)}/docs
+  Jenkins:   set ECR_REPOSITORY={ECR_REPOSITORY} and DEPLOY_HOST={ip}
+  (A server created before ECR existed needs ECR_REPOSITORY={ECR_REPOSITORY} added to its .env.)
   SSH:       ssh -i {KEY_PATH} ec2-user@{ip}
   Boot log:  ssh -i {KEY_PATH} ec2-user@{ip} sudo tail -f /var/log/cloud-init-output.log""")
 

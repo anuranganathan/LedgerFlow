@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 import aws_services
 import events
+import heartbeat
 import kafka_client
 import webhooks
 from database import SessionLocal
@@ -272,6 +273,7 @@ def run_worker() -> None:
     try:
         while True:
             consume_batch(consumer)
+            heartbeat.beat()
     finally:
         consumer.close()
 

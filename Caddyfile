@@ -1,0 +1,16 @@
+# Reverse proxy in front of the API (docker-compose.prod.yml).
+# With a hostname as SITE_ADDRESS, Caddy obtains and renews a Let's Encrypt certificate by
+# itself and redirects http:// to https://. Without a domain, provision_ec2.py uses
+# <ip-with-dashes>.sslip.io, a free DNS name that points at the server's IP.
+{$SITE_ADDRESS::80} {
+	encode gzip
+	header {
+		# Browsers only honour this over HTTPS: always use HTTPS for a year.
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+	reverse_proxy api:8000 {
+		# Send Server-Sent Events (GET /events) to the browser immediately.
+		flush_interval -1
+	}
+}

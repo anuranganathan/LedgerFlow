@@ -4,6 +4,7 @@ import time
 import uuid
 
 import aws_services
+import heartbeat
 from database import SessionLocal
 from models import Notification, NotificationStatus
 from slack_client import format_payment_message, send_slack_message
@@ -30,6 +31,7 @@ def handle_message(message: dict) -> None:
 def run_notifier() -> None:
     logger.info("Notifier started")
     while True:
+        heartbeat.beat()
         try:
             messages = aws_services.receive_notifications()
         except Exception as exc:
