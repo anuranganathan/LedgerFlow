@@ -22,25 +22,14 @@ from sqlalchemy.orm import Session
 import aws_services
 import kafka_client
 from database import SessionLocal
-from models import Account, EntryType, LedgerEntry, Notification, Payment, PaymentStatus, utc_now
+from ledger import lock, transfer
+from models import Account, Notification, Payment, PaymentStatus, Refund, RefundStatus, utc_now
 from redis_client import set_payment_status
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
 MAX_ATTEMPTS = int(os.getenv("WORKER_MAX_ATTEMPTS", "3"))
 RETRY_BASE_SECONDS = float(os.getenv("WORKER_RETRY_BASE_SECONDS", "1"))
-
-
-def lock(db: Session, model, ids: list[uuid.UUID]) -> list:
-    """SELECT ... FOR UPDATE, always in ID order so two transactions can't deadlock.
-
-    populate_existing makes SQLAlchemy use the values read under the lock, not older copies
-    already loaded in the session.
-    """
-    return db.scalars(
-        select(model).where(model.id.in_(ids)).order_by(model.id)
-        .with_for_update().execution_options(populate_existing=True)
-    ).all()
 
 
 def settle(db: Session, payment: Payment) -> None:
@@ -55,14 +44,7 @@ def settle(db: Session, payment: Payment) -> None:
         payment.failure_reason = "Insufficient balance"
         message = "Payment failed because of insufficient balance"
     else:
-        customer.balance -= payment.amount
-        merchant.balance += payment.amount
-        db.add_all([
-            LedgerEntry(payment_id=payment.id, account_id=customer.id,
-                        entry_type=EntryType.DEBIT, amount=payment.amount),
-            LedgerEntry(payment_id=payment.id, account_id=merchant.id,
-                        entry_type=EntryType.CREDIT, amount=payment.amount),
-        ])
+        transfer(db, debit=customer, credit=merchant, amount=payment.amount, payment_id=payment.id)
         payment.status = PaymentStatus.SUCCESS
         message = "Payment processed successfully"
     payment.updated_at = utc_now()
@@ -112,18 +94,7 @@ def complete_side_effects(db: Session, payment: Payment) -> None:
     retried; the money step is then skipped and only the missing side effects are redone.
     """
     # The notification goes first: telling the customer matters more than the receipt.
-    notification = db.scalar(select(Notification).where(Notification.payment_id == payment.id))
-    if notification is not None and notification.enqueued_at is None:
-        aws_services.send_notification({
-            "notification_id": str(notification.id),
-            "payment_id": str(payment.id),
-            "status": payment.status.value,
-            "amount": str(payment.amount),
-            "currency": payment.currency,
-            "reason": payment.failure_reason or "",
-        })
-        notification.enqueued_at = utc_now()
-        db.commit()
+    queue_notification(db, payment, None)
 
     if payment.status == PaymentStatus.SUCCESS and payment.receipt_s3_key is None:
         payment.receipt_s3_key = aws_services.store_receipt(str(payment.id), {
@@ -138,15 +109,86 @@ def complete_side_effects(db: Session, payment: Payment) -> None:
         db.commit()
 
 
+def queue_notification(db: Session, payment: Payment, refund: Refund | None) -> None:
+    """Puts the notification on SQS unless that already happened."""
+    notification = db.scalar(select(Notification).where(
+        Notification.payment_id == payment.id,
+        Notification.refund_id == refund.id if refund else Notification.refund_id.is_(None),
+    ))
+    if notification is None or notification.enqueued_at is not None:
+        return
+    subject = refund or payment
+    aws_services.send_notification({
+        "notification_id": str(notification.id),
+        "kind": "REFUND" if refund else "PAYMENT",
+        "payment_id": str(payment.id),
+        "refund_id": str(refund.id) if refund else "",
+        "status": subject.status.value,
+        "amount": str(subject.amount),
+        "currency": payment.currency,
+        "reason": subject.failure_reason or "",
+    })
+    notification.enqueued_at = utc_now()
+    db.commit()
+
+
+def process_refund(refund_id: uuid.UUID | str, db: Session) -> Refund | None:
+    """Sends a refund's money back from the merchant to the customer. Safe to repeat."""
+    refund_id = uuid.UUID(str(refund_id))
+    found = db.get(Refund, refund_id)
+    if found is None:
+        db.rollback()
+        logger.warning("Refund %s does not exist", refund_id)
+        return None
+    (payment,) = lock(db, Payment, [found.payment_id])  # payment first, then refund, then accounts
+    (refund,) = lock(db, Refund, [refund_id])
+
+    if refund.status == RefundStatus.PENDING:
+        accounts = {account.id: account for account in lock(
+            db, Account, [payment.customer_account_id, payment.merchant_account_id]
+        )}
+        merchant = accounts[payment.merchant_account_id]
+        if merchant.balance < refund.amount:
+            refund.status = RefundStatus.FAILED
+            refund.failure_reason = "Merchant has insufficient balance"
+            message = "Refund failed because the merchant has insufficient balance"
+        else:
+            transfer(db, debit=merchant, credit=accounts[payment.customer_account_id],
+                     amount=refund.amount, payment_id=payment.id, refund_id=refund.id)
+            payment.refunded_amount += refund.amount
+            refund.status = RefundStatus.SUCCESS
+            message = "Refund processed successfully"
+        refund.updated_at = utc_now()
+        db.add(Notification(payment_id=payment.id, refund_id=refund.id, message=message))
+        db.commit()
+        aws_services.put_metric(
+            "RefundsSucceeded" if refund.status == RefundStatus.SUCCESS else "RefundsFailed"
+        )
+        logger.info("Refund %s completed with status %s", refund.id, refund.status.value)
+    else:
+        db.commit()
+
+    queue_notification(db, payment, refund)
+    return refund
+
+
+# Each event type, the field holding the ID it's about, and the function that processes it.
+HANDLERS = {
+    "PAYMENT_CREATED": ("payment_id", process_payment),
+    "REFUND_REQUESTED": ("refund_id", process_refund),
+}
+
+
 def invalid_reason(event: dict[str, Any]) -> str | None:
     if "_invalid" in event:
         return "Message is not a JSON object"
-    if event.get("event_type") != "PAYMENT_CREATED":
+    if event.get("event_type") not in HANDLERS:
         return f"Unknown event type: {event.get('event_type')!r}"
+    field, _ = HANDLERS[event["event_type"]]
     try:
-        uuid.UUID(str(event.get("payment_id")))
+        uuid.UUID(str(event.get(field)))
     except ValueError:
-        return f"Invalid payment_id: {event.get('payment_id')!r}"
+        return f"Invalid {field}: {event.get(field)!r}"
     return None
 
 
@@ -157,9 +199,10 @@ def handle_event(event: dict[str, Any]) -> None:
         dead_letter(event, reason, attempts=0)
         return
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        field, process = HANDLERS[event["event_type"]]
         with SessionLocal() as db:
             try:
-                process_payment(event["payment_id"], db)
+                process(event[field], db)
                 return
             except Exception as exc:
                 db.rollback()

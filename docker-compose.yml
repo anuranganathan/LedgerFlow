@@ -60,6 +60,16 @@ services:
     environment: *app-environment
     depends_on: *app-dependencies
 
+  # Checks that the ledger balances every 5 minutes and reports to CloudWatch.
+  reconciler:
+    build: .
+    command: python reconcile.py
+    restart: on-failure
+    volumes:
+      - .:/app
+    environment: *app-environment
+    depends_on: *app-dependencies
+
   # Applies database migrations once, then exits.
   migrate:
     build: .

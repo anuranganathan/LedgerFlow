@@ -29,6 +29,9 @@ from alembic.runtime.migration import MigrationContext
 from moto import mock_aws
 from sqlalchemy import func, select, text
 
+import aws_services
+import ledger
+import reconcile
 import setup_aws
 import worker
 from database import Base, SessionLocal, engine
@@ -49,6 +52,8 @@ def database(monkeypatch):
     reset_database()
     migrate()
     monkeypatch.setattr(worker, "set_payment_status", lambda *_: None)
+    aws_services.client.cache_clear()
+    aws_services.queue_url.cache_clear()
     with mock_aws():
         setup_aws.create_bucket()
         setup_aws.create_queues()
@@ -57,11 +62,20 @@ def database(monkeypatch):
 
 def add_accounts(balance: str) -> tuple[uuid.UUID, uuid.UUID]:
     with SessionLocal() as db:
-        customer = Account(name="C", account_type=AccountType.CUSTOMER, balance=Decimal(balance), currency="INR")
+        customer = Account(name="C", account_type=AccountType.CUSTOMER, balance=Decimal("0"), currency="INR")
         merchant = Account(name="M", account_type=AccountType.MERCHANT, balance=Decimal("0"), currency="INR")
         db.add_all([customer, merchant])
         db.commit()
+        if Decimal(balance):
+            ledger.top_up(db, customer.id, Decimal(balance), "Test funds")
+            db.commit()
         return customer.id, merchant.id
+
+
+def assert_books_balance() -> None:
+    with SessionLocal() as db:
+        report = reconcile.run_checks(db)
+    assert report["ledger_problems"] == 0, report
 
 
 def add_payments(customer_id, merchant_id, amount: str, count: int) -> list[uuid.UUID]:
@@ -100,6 +114,7 @@ def test_concurrent_payments_never_overdraw_the_customer():
     assert statuses.count(PaymentStatus.FAILED) == 7
     assert balance(customer) == Decimal("10.00")
     assert balance(merchant) == Decimal("90.00")
+    assert_books_balance()
 
 
 def test_same_payment_processed_by_many_workers_moves_money_once():
@@ -108,7 +123,8 @@ def test_same_payment_processed_by_many_workers_moves_money_once():
     process_in_parallel([payment_id] * 8)
     assert balance(customer) == Decimal("60.00")
     with SessionLocal() as db:
-        assert db.scalar(select(func.count()).select_from(LedgerEntry)) == 2
+        assert db.scalar(select(func.count()).where(LedgerEntry.payment_id.is_not(None))) == 2
+    assert_books_balance()
 
 
 def test_funding_during_payments_loses_no_update(client_factory=None):
@@ -126,12 +142,39 @@ def test_funding_during_payments_loses_no_update(client_factory=None):
         [future.result() for future in processing]
     with SessionLocal() as db:
         succeeded = db.scalar(select(func.count()).where(Payment.status == PaymentStatus.SUCCESS))
-        debits = db.scalar(select(func.coalesce(func.sum(LedgerEntry.amount), 0))
-                           .where(LedgerEntry.entry_type == EntryType.DEBIT))
+        debits = db.scalar(select(func.coalesce(func.sum(LedgerEntry.amount), 0)).where(
+            LedgerEntry.entry_type == EntryType.DEBIT, LedgerEntry.payment_id.is_not(None)))
     # 20 top-ups of 10, minus whatever was paid: no update was overwritten.
     assert balance(customer) == Decimal("200.00") - Decimal("10.00") * succeeded
     assert debits == Decimal("10.00") * succeeded
     assert balance(merchant) == debits
+    assert_books_balance()
+
+
+def test_concurrent_refund_requests_cannot_refund_more_than_the_payment():
+    from fastapi.testclient import TestClient
+
+    from app import app
+
+    customer, merchant = add_accounts("100.00")
+    (payment_id,) = add_payments(customer, merchant, "100.00", 1)
+    process_in_parallel([payment_id])
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=10) as pool:
+        responses = list(pool.map(
+            lambda _: client.post(f"/payments/{payment_id}/refunds", json={"amount": "40.00"}), range(10)
+        ))
+    assert sorted(r.status_code for r in responses).count(202) == 2  # 40 + 40 <= 100 < 120
+    refund_ids = [r.json()["id"] for r in responses if r.status_code == 202]
+
+    def run(refund_id):
+        with SessionLocal() as db:
+            worker.process_refund(refund_id, db)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(run, refund_ids * 2))  # each refund processed twice, concurrently
+    assert balance(customer) == Decimal("80.00")
+    assert balance(merchant) == Decimal("20.00")
+    assert_books_balance()
 
 
 def test_migrations_match_the_models_on_postgresql():
@@ -152,7 +195,7 @@ def test_migrations_adopt_an_existing_database_and_requeue_stuck_payments():
             "('11111111-1111-1111-1111-111111111111','C','CUSTOMER',50,'INR',now()),"
             "('22222222-2222-2222-2222-222222222222','M','MERCHANT',0,'INR',now())"
         ))
-        for status in ["PROCESSING", "PENDING", "SUCCESS"]:
+        for status in ["PROCESSING", "PENDING", "FAILED"]:
             connection.execute(text(
                 "INSERT INTO payments (id, customer_account_id, merchant_account_id, amount, currency,"
                 " status, created_at, updated_at) VALUES (:id, '11111111-1111-1111-1111-111111111111',"
@@ -162,5 +205,8 @@ def test_migrations_adopt_an_existing_database_and_requeue_stuck_payments():
     with SessionLocal() as db:
         assert db.scalar(select(func.count()).select_from(OutboxEvent)) == 2
         assert sorted(db.scalars(select(Payment.status)).all()) == sorted(
-            [PaymentStatus.PENDING, PaymentStatus.PENDING, PaymentStatus.SUCCESS]
+            [PaymentStatus.PENDING, PaymentStatus.PENDING, PaymentStatus.FAILED]
         )
+        # The balance funded without a ledger entry became an opening-balance top-up.
+        assert db.get(Account, ledger.system_account_id("INR")).balance == Decimal("-50.00")
+    assert_books_balance()

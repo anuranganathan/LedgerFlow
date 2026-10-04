@@ -16,6 +16,7 @@ import app as app_module
 import aws_services
 import kafka_client
 import notifier
+import reconcile
 import relay
 import setup_aws
 import worker
@@ -35,6 +36,8 @@ def clean_environment(monkeypatch):
     monkeypatch.setattr(worker, "set_payment_status", lambda *_: None)
     monkeypatch.setattr(worker, "RETRY_BASE_SECONDS", 0)
     # moto fakes AWS in memory, so the real setup script creates the bucket and queues.
+    aws_services.client.cache_clear()
+    aws_services.queue_url.cache_clear()
     with mock_aws():
         setup_aws.create_bucket()
         setup_aws.create_queues()
@@ -57,6 +60,10 @@ def create_accounts(client: TestClient):
         "/accounts", json={"name": "Merchant", "account_type": "MERCHANT", "currency": "INR"}
     ).json()
     return customer, merchant
+
+
+def payment_entries(db, payment_id) -> list[LedgerEntry]:
+    return db.scalars(select(LedgerEntry).where(LedgerEntry.payment_id == uuid.UUID(str(payment_id)))).all()
 
 
 def create_payment(client: TestClient, amount: str = "500.00"):
@@ -124,7 +131,7 @@ def test_success_creates_debit_and_credit_ledger_entries(client):
     client.post(f"/accounts/{customer['id']}/fund", json={"amount": "1000.00"})
     with SessionLocal() as db:
         worker.process_payment(response.json()["payment_id"], db)
-        entries = db.scalars(select(LedgerEntry)).all()
+        entries = payment_entries(db, response.json()["payment_id"])
         assert {entry.entry_type for entry in entries} == {EntryType.DEBIT, EntryType.CREDIT}
         assert all(entry.amount == Decimal("250.00") for entry in entries)
 
@@ -202,6 +209,7 @@ def test_setup_aws_is_safe_to_run_twice():
     # Running setup twice updates the alarms in place instead of creating duplicates.
     assert sorted(alarm["AlarmName"] for alarm in alarms) == [
         "ledgerflow-dead-lettered-events", "ledgerflow-failed-payments",
+        "ledgerflow-ledger-mismatch", "ledgerflow-stuck-items",
     ]
 
 
@@ -271,7 +279,7 @@ def test_duplicate_event_moves_money_only_once(client):
     with SessionLocal() as db:
         worker.process_payment(payment_id, db)
         worker.process_payment(payment_id, db)
-        assert len(db.scalars(select(LedgerEntry)).all()) == 2
+        assert len(payment_entries(db, payment_id)) == 2
         assert len(db.scalars(select(Notification)).all()) == 1
         payment = db.get(Payment, uuid.UUID(payment_id))
         assert db.get(Account, payment.customer_account_id).balance == Decimal("500.00")
@@ -293,7 +301,7 @@ def test_side_effects_resume_after_a_failure_without_moving_money_again(client, 
         payment = worker.process_payment(payment_id, db)
         assert payment.receipt_s3_key == f"receipts/{payment_id}.json"
         assert db.get(Account, payment.customer_account_id).balance == Decimal("500.00")
-        assert len(db.scalars(select(LedgerEntry)).all()) == 2
+        assert len(payment_entries(db, payment_id)) == 2
     assert len(aws_services.receive_notifications()) == 1
 
 
@@ -335,7 +343,7 @@ def test_failing_event_is_retried_then_dead_lettered(client, monkeypatch):
         calls.append(payment_id)
         raise RuntimeError("database unavailable")
 
-    monkeypatch.setattr(worker, "process_payment", broken)
+    monkeypatch.setitem(worker.HANDLERS, "PAYMENT_CREATED", ("payment_id", broken))
     event = {"event_type": "PAYMENT_CREATED", "payment_id": str(uuid.uuid4())}
     consumer = FakeConsumer([event])
     worker.consume_batch(consumer)
@@ -389,3 +397,154 @@ def test_migrations_create_the_same_schema_as_the_models(tmp_path):
     with migrated.connect() as connection:
         context = MigrationContext.configure(connection, opts={"compare_type": True})
         assert compare_metadata(context, Base.metadata) == []
+
+
+# ---------- Ledger integrity: top-ups, refunds, reconciliation ----------
+
+def settle(payment_id) -> None:
+    with SessionLocal() as db:
+        worker.process_payment(payment_id, db)
+
+
+def refund(client: TestClient, payment_id: str, **body):
+    response = client.post(f"/payments/{payment_id}/refunds", json=body)
+    if response.status_code == 202:
+        with SessionLocal() as db:
+            worker.process_refund(response.json()["id"], db)
+    return response
+
+
+def test_top_up_is_recorded_in_the_ledger_against_the_system_account(client):
+    customer, _ = create_accounts(client)
+    client.post(f"/accounts/{customer['id']}/fund", json={"amount": "750.00"})
+    statement = client.get(f"/accounts/{customer['id']}/ledger").json()
+    assert [(e["entry_type"], e["amount"]) for e in statement] == [("CREDIT", "750.00")]
+    assert statement[0]["top_up_id"] is not None
+    # The system account is internal: it isn't listed.
+    assert {a["account_type"] for a in client.get("/accounts").json()} == {"CUSTOMER", "MERCHANT"}
+    with SessionLocal() as db:
+        assert reconcile.run_checks(db)["ok"]
+
+
+@pytest.mark.parametrize("body, field", [
+    ({"amount": "0.001"}, "amount"),
+    ({"amount": "-5"}, "amount"),
+    ({"amount": "12345678901234"}, "amount"),
+    ({"amount": "10", "currency": "XYZ"}, "currency"),
+])
+def test_invalid_payment_amounts_and_currencies_are_rejected(client, body, field):
+    customer, merchant = create_accounts(client)
+    response = client.post("/payments", json={
+        "customer_account_id": customer["id"], "merchant_account_id": merchant["id"], **body,
+    })
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"][-1] == field
+
+
+def test_system_accounts_cannot_be_created_through_the_api(client):
+    response = client.post("/accounts", json={"name": "Sneaky", "account_type": "SYSTEM"})
+    assert response.status_code == 422
+
+
+def test_database_rejects_a_negative_customer_balance(client):
+    from sqlalchemy.exc import IntegrityError
+
+    customer, _ = create_accounts(client)
+    with SessionLocal() as db, pytest.raises(IntegrityError):
+        db.get(Account, uuid.UUID(customer["id"])).balance = Decimal("-1.00")
+        db.commit()
+
+
+def test_full_refund_returns_the_money_and_is_recorded(client):
+    payment_id = funded_payment(client)
+    settle(payment_id)
+    response = refund(client, payment_id, reason="Damaged item")
+    assert response.status_code == 202
+    assert response.json()["amount"] == "500.00"
+    assert response.headers["Location"] == f"/refunds/{response.json()['id']}"
+    assert client.get(f"/refunds/{response.json()['id']}").json()["status"] == "SUCCESS"
+    payment = client.get(f"/payments/{payment_id}").json()
+    assert payment["refunded_amount"] == "500.00"
+    assert client.get(f"/accounts/{payment['customer_account_id']}").json()["balance"] == "1000.00"
+    assert client.get(f"/accounts/{payment['merchant_account_id']}").json()["balance"] == "0.00"
+    ledger = client.get(f"/payments/{payment_id}/ledger").json()
+    assert len(ledger) == 4 and sum(1 for e in ledger if e["refund_id"]) == 2
+    with SessionLocal() as db:
+        assert reconcile.run_checks(db)["ok"]
+
+
+def test_partial_refunds_cannot_exceed_the_payment(client):
+    payment_id = funded_payment(client)
+    settle(payment_id)
+    assert refund(client, payment_id, amount="200.00").status_code == 202
+    over = refund(client, payment_id, amount="300.01")
+    assert over.status_code == 400 and "300.00" in over.json()["detail"]
+    assert refund(client, payment_id).json()["amount"] == "300.00"  # the rest
+    assert refund(client, payment_id).status_code == 409
+
+
+def test_only_successful_payments_can_be_refunded(client):
+    payment_id = create_payment(client)[0].json()["payment_id"]  # not funded
+    assert refund(client, payment_id).status_code == 409  # still pending
+    settle(payment_id)
+    assert refund(client, payment_id).status_code == 409  # failed
+
+
+def test_refund_fails_when_the_merchant_has_spent_the_money(client, monkeypatch):
+    sent = []
+    monkeypatch.setattr(notifier, "send_slack_message", sent.append)
+    payment_id = funded_payment(client)
+    settle(payment_id)
+    merchant_id = client.get(f"/payments/{payment_id}").json()["merchant_account_id"]
+    with SessionLocal() as db:
+        db.get(Account, uuid.UUID(merchant_id)).balance = Decimal("100.00")
+        db.commit()
+    response = refund(client, payment_id)
+    result = client.get(f"/refunds/{response.json()['id']}").json()
+    assert (result["status"], result["failure_reason"]) == ("FAILED", "Merchant has insufficient balance")
+    for message in aws_services.receive_notifications():
+        notifier.handle_message(message)
+    assert any("Refund FAILED" in text for text in sent)
+
+
+def test_duplicate_refund_event_moves_money_once(client):
+    payment_id = funded_payment(client)
+    settle(payment_id)
+    refund_id = refund(client, payment_id).json()["id"]
+    with SessionLocal() as db:
+        worker.process_refund(refund_id, db)
+    assert client.get(f"/payments/{payment_id}").json()["refunded_amount"] == "500.00"
+    assert len(client.get(f"/payments/{payment_id}/ledger").json()) == 4
+
+
+def test_reconciliation_detects_a_tampered_balance_and_stuck_payments(client):
+    from datetime import datetime, timedelta, timezone
+
+    payment_id = funded_payment(client)
+    with SessionLocal() as db:
+        payment = db.get(Payment, uuid.UUID(payment_id))
+        payment.created_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+        db.scalars(select(OutboxEvent)).one().created_at = payment.created_at  # never published
+        db.get(Account, payment.merchant_account_id).balance += Decimal("1.00")  # money from nowhere
+        db.commit()
+        report = reconcile.run_checks(db)
+    assert not report["ok"]
+    assert report["ledger_problems"] == 1
+    assert report["account_mismatches"][0]["balance"] == "1.00"
+    assert report["stuck_payments"] == 1
+    assert report["stale_outbox_events"] == 1
+
+
+def test_reconciliation_publishes_metrics(client):
+    funded_payment(client)
+    reconcile.run_once()
+    metrics = aws_services.client("cloudwatch").list_metrics(Namespace="LedgerFlow")["Metrics"]
+    assert {"LedgerMismatches", "StuckItems"} <= {metric["MetricName"] for metric in metrics}
+
+
+def test_lists_are_paginated(client):
+    for _ in range(3):
+        create_payment(client)
+    assert len(client.get("/payments?limit=2").json()) == 2
+    assert len(client.get("/payments?limit=2&offset=2").json()) == 1
+    assert client.get("/payments?limit=1000").status_code == 422
