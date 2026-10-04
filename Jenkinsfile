@@ -61,7 +61,8 @@ pipeline {
         stage('Build image') {
             steps {
                 // The server is ARM (AWS Graviton), so the image is built for arm64.
-                sh 'docker build --platform linux/arm64 -t "$IMAGE" .'
+                sh 'docker build --platform linux/arm64 --provenance=false -t "$IMAGE" .'
+
             }
         }
 
