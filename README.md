@@ -2,9 +2,34 @@
 
 LedgerFlow is an event-driven payment processing system built with a focus on reliability, asynchronous processing and cloud integration. A REST API accepts payments, a transactional outbox and Kafka hand them to a background worker, and the worker moves money with a double-entry ledger. Receipts go to Amazon S3, notifications flow through Amazon SQS to Slack, and metrics and logs go to Amazon CloudWatch. A Jenkins pipeline tests, builds and deploys it to AWS EC2.
 
-**Live demo:** <http://52.66.120.13> · **API docs:** <http://52.66.120.13/docs> (hosted on AWS EC2, ap-south-1)
+## Live demo
 
-> Simulation only: no real money, banks or card data are involved.
+| | |
+|---|---|
+| **App** | <https://52-66-120-13.sslip.io> |
+| **API docs (Swagger)** | <https://52-66-120-13.sslip.io/docs> |
+| **Health check** | <https://52-66-120-13.sslip.io/health> |
+
+Hosted on AWS EC2 (ap-south-1) over HTTPS with a Let's Encrypt certificate, deployed by the Jenkins pipeline below.
+
+**Try it in a minute:**
+
+1. Open the app and click **Try the demo**. It creates a customer with ₹5000 and a merchant, and logs you in as the customer.
+2. Pay the demo store. The result appears in about a second through a live update (watch the **● Live** badge), with no page refresh.
+3. Pay more than your balance to see a `FAILED` payment with its reason.
+4. Click a payment to see its double-entry ledger lines and the receipt stored in S3.
+5. Click **Switch to merchant view** and refund part of the payment.
+
+> Simulation only: no real money, banks or card data are involved. Demo accounts are throwaway.
+
+## Highlights
+
+- **Never loses a payment:** transactional outbox, Kafka with manual offset commits, retries and a dead-letter topic.
+- **Never moves money twice:** idempotent workers, row locking in a fixed order, `Idempotency-Key` on payments and refunds.
+- **Auditable money:** double-entry ledger, refunds, database constraints, and a reconciliation job with CloudWatch alarms.
+- **Secure:** argon2 passwords, short-lived JWTs with rotating refresh tokens, per-user data access, rate limiting, HTTPS, least-privilege IAM with no keys on the server.
+- **Real-time:** Server-Sent Events to the dashboard and HMAC-signed webhooks to merchants.
+- **Shipped by CI/CD:** Jenkins runs 81 tests (including PostgreSQL concurrency tests), builds one image per commit, pushes it to ECR (scanned on push), and deploys that exact commit to EC2 with health checks and automatic rollback.
 
 ## Architecture
 
@@ -129,6 +154,7 @@ git push → Jenkins → unit tests → PostgreSQL tests → image ledgerflow:<c
 - **One image per commit.** Every app service runs the same image, built for arm64 (the server is Graviton) and pushed to **Amazon ECR** with immutable tags, scanned on push, the last 30 kept. The server only pulls, so production runs exactly the commit that passed the tests.
 - **Deploy** ([`deploy.sh`](deploy.sh)) checks out that commit, starts it and waits until every container is healthy: the API answers `/health`, and each background process reports a heartbeat (a stuck worker counts as down). If that doesn't happen within 5 minutes, it **redeploys the last healthy commit** and fails the build. Only `main` is deployed, and builds never run in parallel.
 - Without ECR configured, the server builds the image for that exact commit itself.
+- Images apply Debian security updates at build time: ECR's scan went from 6 critical / 20 high findings to 0 critical / 3 high (the rest have no upstream fix yet).
 - Jenkins itself runs in Docker: `docker compose -f jenkins/docker-compose.yml up -d --build`, then open <http://localhost:8080>. Set `ECR_REPOSITORY`, `DEPLOY_HOST`, `DEPLOY_USER` and optionally `SITE_URL`, plus the credentials `aws-ecr-push` and `deploy-ssh-key`.
 
 ### AWS automation with Python (boto3)
