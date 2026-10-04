@@ -6,7 +6,9 @@ from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
-from models import AccountType, EntryType, NotificationStatus, PaymentStatus, RefundStatus, UserRole
+from models import (
+    AccountType, DeliveryStatus, EntryType, NotificationStatus, PaymentStatus, RefundStatus, UserRole,
+)
 
 SUPPORTED_CURRENCIES = set(os.getenv("SUPPORTED_CURRENCIES", "INR,USD,EUR,GBP").split(","))
 MAX_TOP_UP = Decimal("1000000.00")
@@ -155,3 +157,33 @@ class Page(BaseModel):
 
 class MeResponse(UserResponse):
     accounts: list[AccountResponse]
+
+
+class WebhookEndpointRequest(BaseModel):
+    url: str = Field(min_length=8, max_length=500)
+
+
+class WebhookEndpointResponse(ORMModel):
+    account_id: uuid.UUID
+    url: str
+    enabled: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class WebhookSecretResponse(WebhookEndpointResponse):
+    # Returned only when the secret is created or rotated.
+    secret: str
+
+
+class WebhookDeliveryResponse(ORMModel):
+    id: uuid.UUID
+    payment_id: uuid.UUID
+    refund_id: uuid.UUID | None
+    event_type: str
+    status: DeliveryStatus
+    attempts: int
+    last_status_code: int | None
+    last_error: str | None
+    created_at: datetime
+    delivered_at: datetime | None

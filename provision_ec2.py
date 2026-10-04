@@ -23,7 +23,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 import setup_aws
-from aws_services import AWS_REGION, METRICS_NAMESPACE, SQS_QUEUE_NAME
+from aws_services import AWS_REGION, METRICS_NAMESPACE, SQS_QUEUE_NAME, WEBHOOK_QUEUE_NAME
 
 NAME = "ledgerflow"
 INSTANCE_TYPE = "t4g.small"  # 2 vCPU, 2 GB RAM, ARM (Graviton)
@@ -52,8 +52,10 @@ def create_iam_role() -> None:
             {"Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObject"],
              "Resource": f"arn:aws:s3:::{BUCKET}/*"},
             {"Effect": "Allow",
-             "Action": ["sqs:GetQueueUrl", "sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage"],
-             "Resource": f"arn:aws:sqs:{AWS_REGION}:{ACCOUNT_ID}:{SQS_QUEUE_NAME}"},
+             "Action": ["sqs:GetQueueUrl", "sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage",
+                        "sqs:ChangeMessageVisibility"],
+             "Resource": [f"arn:aws:sqs:{AWS_REGION}:{ACCOUNT_ID}:{queue}"
+                          for queue in (SQS_QUEUE_NAME, WEBHOOK_QUEUE_NAME)]},
             {"Effect": "Allow", "Action": "cloudwatch:PutMetricData", "Resource": "*",
              "Condition": {"StringEquals": {"cloudwatch:namespace": METRICS_NAMESPACE}}},
             {"Effect": "Allow", "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],

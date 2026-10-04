@@ -86,6 +86,16 @@ services:
         awslogs-group: /ledgerflow/app
         awslogs-stream: notifier
 
+  webhooks:
+    <<: *app
+    command: python webhooks.py
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /ledgerflow/app
+        awslogs-stream: webhooks
+
   reconciler:
     <<: *app
     command: python reconcile.py

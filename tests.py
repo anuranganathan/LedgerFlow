@@ -1,4 +1,6 @@
+import json
 import os
+import time
 import uuid
 from decimal import Decimal
 
@@ -248,6 +250,16 @@ class FakeKafka:
         if self.down:
             raise ConnectionError("Kafka unavailable")
         self.messages.append((topic, key, value))
+
+
+def funded_payment_for(client: TestClient, merchant: dict, amount: str = "500.00") -> str:
+    """A funded customer pays the given merchant; returns the payment ID."""
+    customer = signup(client, "CUSTOMER")
+    act_as(client, customer)
+    client.post(f"/accounts/{customer['id']}/fund", json={"amount": "1000.00"})
+    return client.post("/payments", json={
+        "customer_account_id": customer["id"], "merchant_account_id": merchant["id"], "amount": amount,
+    }).json()["payment_id"]
 
 
 def funded_payment(client: TestClient, amount: str = "500.00", funds: str = "1000.00") -> str:
@@ -785,3 +797,197 @@ def test_dashboard_is_served_with_security_headers(client):
     assert "script-src 'self'" in response.headers["Content-Security-Policy"]
     assert response.headers["X-Frame-Options"] == "DENY"
     assert client.get("/static/app.js").status_code == 200
+
+
+# ---------- Live updates and merchant webhooks ----------
+
+import socket  # noqa: E402
+
+import events  # noqa: E402
+import webhooks  # noqa: E402
+from examples.webhook_receiver import verify_signature  # noqa: E402
+
+REAL_GETADDRINFO = socket.getaddrinfo
+FAKE_DNS = {"shop.example": "93.184.216.34", "internal.example": "10.0.0.5", "metadata.example": "169.254.169.254"}
+
+
+@pytest.fixture
+def fake_dns(monkeypatch):
+    def getaddrinfo(host, port, *args, **kwargs):
+        if host in FAKE_DNS:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (FAKE_DNS[host], port))]
+        return REAL_GETADDRINFO(host, port, *args, **kwargs)
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+
+
+class FakeMerchantServer:
+    def __init__(self, status_code=200):
+        self.status_code = status_code
+        self.requests = []
+
+    def send(self, request):
+        import httpx
+        self.requests.append({"url": str(request.url), "body": request.content,
+                              "headers": request.headers, "extensions": request.extensions})
+        return httpx.Response(self.status_code)
+
+
+def deliver_queued_webhooks() -> None:
+    for message in aws_services.receive_messages(aws_services.WEBHOOK_QUEUE_NAME, wait_seconds=0):
+        webhooks.handle_message(message)
+
+
+def register_webhook(client, merchant, url="https://shop.example/hooks"):
+    return client.put(f"/accounts/{merchant['id']}/webhook-endpoint", json={"url": url},
+                      headers=merchant["headers"])
+
+
+def test_webhook_signature_can_be_verified_and_not_forged():
+    body = b'{"id":"1"}'
+    header = webhooks.sign("whsec_test", int(time.time()), body)
+    assert verify_signature("whsec_test", header, body)
+    assert not verify_signature("whsec_test", header, b'{"id":"2"}')  # body changed
+    assert not verify_signature("whsec_other", header, body)  # wrong secret
+    assert not verify_signature("whsec_test", header, body, now=time.time() + 600)  # replayed later
+
+
+@pytest.mark.parametrize("url, error", [
+    ("http://shop.example/hooks", "https"),
+    ("https://internal.example/hooks", "private"),
+    ("https://metadata.example/latest", "private"),
+    ("https://127.0.0.1/hooks", "private"),
+    ("https://user:pass@shop.example/hooks", "credentials"),
+])
+def test_unsafe_webhook_urls_are_rejected(client, fake_dns, url, error):
+    _, merchant = create_accounts(client)
+    response = register_webhook(client, merchant, url)
+    assert response.status_code == 400 and error in response.json()["detail"]
+
+
+def test_only_the_merchant_can_manage_its_webhooks(client, fake_dns):
+    customer, merchant = create_accounts(client)
+    assert register_webhook(client, customer).status_code == 400  # not a merchant account
+    other = signup(client, "MERCHANT")
+    assert register_webhook(client, {**merchant, "headers": other["headers"]}).status_code == 404
+    first = register_webhook(client, merchant)
+    assert first.status_code == 200 and first.json()["secret"].startswith("whsec_")
+    assert "secret" not in register_webhook(client, merchant, "https://shop.example/v2").json()
+    assert client.get(f"/accounts/{merchant['id']}/webhook-deliveries", headers=other["headers"]).status_code == 404
+
+
+def test_payment_events_are_delivered_signed_to_the_merchant(client, fake_dns, monkeypatch):
+    server = FakeMerchantServer()
+    monkeypatch.setattr(webhooks, "send", server.send)
+    _, merchant = create_accounts(client)
+    secret = register_webhook(client, merchant).json()["secret"]
+    payment_id = funded_payment_for(client, merchant)
+    settle(payment_id)
+    settle(payment_id)  # a redelivered Kafka event must not create a second delivery
+    deliver_queued_webhooks()
+
+    (request,) = server.requests
+    # Sent to the IP address that was checked, with the real hostname for HTTP and TLS.
+    assert request["url"] == "https://93.184.216.34/hooks"
+    assert request["headers"]["Host"] == "shop.example"
+    assert request["extensions"]["sni_hostname"] == "shop.example"
+    assert verify_signature(secret, request["headers"]["LedgerFlow-Signature"], request["body"])
+    event = json.loads(request["body"])
+    assert event["type"] == "payment.succeeded" and event["data"]["payment_id"] == payment_id
+    assert request["headers"]["LedgerFlow-Event-Id"] == event["id"]
+    (delivery,) = client.get(f"/accounts/{merchant['id']}/webhook-deliveries", headers=merchant["headers"]).json()
+    assert (delivery["status"], delivery["attempts"], delivery["last_status_code"]) == ("DELIVERED", 1, 200)
+
+
+def test_failed_webhooks_are_retried_with_backoff_then_marked_failed(client, fake_dns, monkeypatch):
+    server = FakeMerchantServer(status_code=500)
+    monkeypatch.setattr(webhooks, "send", server.send)
+    delays = []
+    monkeypatch.setattr(aws_services, "retry_later", lambda queue, handle, seconds: delays.append(seconds))
+    _, merchant = create_accounts(client)
+    register_webhook(client, merchant)
+    settle(funded_payment_for(client, merchant))
+    message = aws_services.receive_messages(aws_services.WEBHOOK_QUEUE_NAME, wait_seconds=0)[0]
+    for _ in range(webhooks.MAX_ATTEMPTS):
+        webhooks.handle_message(message)  # SQS hands the same message back after each delay
+    assert delays == webhooks.RETRY_DELAYS
+    (delivery,) = client.get(f"/accounts/{merchant['id']}/webhook-deliveries", headers=merchant["headers"]).json()
+    assert (delivery["status"], delivery["attempts"], delivery["last_error"]) == ("FAILED", 8, "HTTP 500")
+
+    # After fixing their server, the merchant retries it.
+    server.status_code = 200
+    retried = client.post(f"/webhook-deliveries/{delivery['id']}/retry", headers=merchant["headers"])
+    assert retried.status_code == 202 and retried.json()["status"] == "PENDING"
+    deliver_queued_webhooks()
+    assert client.get(f"/accounts/{merchant['id']}/webhook-deliveries",
+                      headers=merchant["headers"]).json()[0]["status"] == "DELIVERED"
+
+
+def test_refund_events_are_delivered(client, fake_dns, monkeypatch):
+    server = FakeMerchantServer()
+    monkeypatch.setattr(webhooks, "send", server.send)
+    _, merchant = create_accounts(client)
+    register_webhook(client, merchant)
+    payment_id = funded_payment_for(client, merchant)
+    settle(payment_id)
+    refund(client, payment_id, amount="100.00")
+    deliver_queued_webhooks()
+    assert [json.loads(r["body"])["type"] for r in server.requests] == ["payment.succeeded", "refund.succeeded"]
+
+
+def test_settlement_pushes_a_live_update_to_both_users(client):
+    _, merchant = create_accounts(client)
+    pubsub = redis_client.client.pubsub(ignore_subscribe_messages=True)
+    pubsub.psubscribe(events.channel("*"))
+    payment_id = funded_payment_for(client, merchant)
+    customer_owner = ACTORS[client.get(f"/payments/{payment_id}").json()["customer_account_id"]]["owner_id"]
+    settle(payment_id)
+    received = [m for m in (pubsub.get_message(timeout=0.2) for _ in range(10)) if m][:2]
+    assert {m["channel"] for m in received} == {events.channel(merchant["owner_id"]), events.channel(customer_owner)}
+    assert json.loads(received[0]["data"]) == {
+        "type": "payment.updated", "payment_id": payment_id, "refund_id": None, "status": "SUCCESS",
+        "amount": "500.00", "failure_reason": None,
+    }
+
+
+def test_live_event_stream_forwards_updates():
+    import asyncio
+
+    server = fakeredis.FakeServer()
+    publisher = fakeredis.FakeRedis(server=server, decode_responses=True)
+    user_id = uuid.uuid4()
+
+    async def read_two():
+        async def connected():
+            return False
+        stream = events.stream(user_id, connected, fakeredis.FakeAsyncRedis(server=server, decode_responses=True))
+        first = await anext(stream)
+        publisher.publish(events.channel(user_id), '{"status": "SUCCESS"}')
+        second = await anext(stream)
+        await stream.aclose()
+        return first, second
+
+    first, second = asyncio.run(read_two())
+    assert first.startswith("event: ready")
+    assert second == 'event: update\ndata: {"status": "SUCCESS"}\n\n'
+
+
+def test_live_event_stream_requires_login(client):
+    assert client.get("/events").status_code == 401
+    assert client.get("/events", headers={"Authorization": "Bearer nope"}).status_code == 401
+
+
+def test_reconciler_queues_deliveries_that_were_never_queued(client, fake_dns, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from models import WebhookDelivery
+
+    _, merchant = create_accounts(client)
+    register_webhook(client, merchant)
+    monkeypatch.setattr(webhooks, "queue_deliveries", lambda *args: None)  # simulate a crash right after settling
+    settle(funded_payment_for(client, merchant))
+    with SessionLocal() as db:
+        delivery = db.scalars(select(WebhookDelivery)).one()
+        delivery.created_at = datetime.now(timezone.utc) - timedelta(minutes=2)
+        db.commit()
+    reconcile.run_once()
+    assert len(aws_services.receive_messages(aws_services.WEBHOOK_QUEUE_NAME, wait_seconds=0)) == 1

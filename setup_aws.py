@@ -9,7 +9,7 @@ import os
 
 from botocore.exceptions import ClientError
 
-from aws_services import AWS_REGION, METRICS_NAMESPACE, S3_BUCKET, SQS_QUEUE_NAME, client
+from aws_services import AWS_REGION, METRICS_NAMESPACE, S3_BUCKET, SQS_QUEUE_NAME, WEBHOOK_QUEUE_NAME, client
 
 LOG_GROUP = "/ledgerflow/app"
 ALERT_TOPIC = "ledgerflow-alerts"
@@ -41,18 +41,25 @@ def create_bucket() -> None:
 
 
 def create_queues() -> None:
+    # Notifications: after 3 failed Slack attempts a message moves to the dead-letter queue.
+    create_queue(SQS_QUEUE_NAME, max_receives=3)
+    # Webhooks: webhooks.py retries with its own backoff and gives up after 8 attempts; the
+    # dead-letter queue only catches messages the sender itself kept crashing on.
+    create_queue(WEBHOOK_QUEUE_NAME, max_receives=12)
+
+
+def create_queue(name: str, max_receives: int) -> None:
     sqs = client("sqs")
-    # Messages that fail 3 times move to the dead-letter queue instead of retrying forever.
-    dlq_url = sqs.create_queue(QueueName=f"{SQS_QUEUE_NAME}-dlq")["QueueUrl"]
+    dlq_url = sqs.create_queue(QueueName=f"{name}-dlq")["QueueUrl"]
     dlq_arn = sqs.get_queue_attributes(QueueUrl=dlq_url, AttributeNames=["QueueArn"])[
         "Attributes"]["QueueArn"]
     sqs.create_queue(
-        QueueName=SQS_QUEUE_NAME,
+        QueueName=name,
         Attributes={
-            "RedrivePolicy": json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": "3"}),
+            "RedrivePolicy": json.dumps({"deadLetterTargetArn": dlq_arn, "maxReceiveCount": str(max_receives)}),
         },
     )
-    print(f"SQS queue {SQS_QUEUE_NAME} ready (DLQ: {SQS_QUEUE_NAME}-dlq)")
+    print(f"SQS queue {name} ready (DLQ: {name}-dlq)")
 
 
 def create_monitoring() -> None:

@@ -21,6 +21,11 @@ flowchart LR
     Worker -- receipt --> S3[(Amazon S3)]
     Worker -- event --> SQS[[Amazon SQS]]
     Worker -- metrics --> CW[Amazon CloudWatch]
+    Worker -- live update --> Cache
+    Cache -- Server-Sent Events --> API
+    Worker -- webhook job --> WQ[[SQS webhooks]]
+    WQ --> Sender[Webhook sender]
+    Sender -- signed POST --> Shop[Merchant server]
     SQS --> Notifier[Notifier]
     Notifier --> Slack[Slack #payment-alerts]
     SQS -. after 3 failures .-> DLQ[[Dead-letter queue]]
@@ -50,6 +55,19 @@ Every step can crash or find a dependency down, so each hand-off is designed to 
 | SQS → Slack | At-least-once, duplicates skipped | The message is deleted only after Slack accepts it, and a notification already marked `SENT` isn't posted again. |
 
 These are covered by tests, including concurrency tests on real PostgreSQL (`tests_postgres.py`).
+
+## How customers and merchants find out the result
+
+`POST /payments` answers `202 Accepted` straight away; the result follows in three ways:
+
+| Who | How | Details |
+|---|---|---|
+| Customer and merchant in the dashboard | **Live update (Server-Sent Events)** | When the worker settles a payment or refund it publishes an event on Redis for both users; `GET /events` streams it to their open dashboards. The result appears in about 0.3 s, no polling. On reconnect the dashboard reloads, so nothing is missed. |
+| The merchant's server | **Signed webhooks** | `PUT /accounts/{id}/webhook-endpoint` registers a URL. Events (`payment.succeeded`, `payment.failed`, `refund.succeeded`, `refund.failed`) are POSTed with an HMAC-SHA256 `LedgerFlow-Signature` header, retried with backoff (8 attempts over ~2 hours), and logged per attempt; failed deliveries can be retried. `examples/webhook_receiver.py` shows how to verify them. |
+| Any API client | **Polling** | `GET /payments/{id}` (the `status_url` from the 202 response). |
+| The operations team | **Slack** | Through SQS and the notifier, as before. |
+
+Webhook safety: URLs must be https and resolve only to public IPs (checked when saved and again at every delivery; the request goes to the checked IP, so DNS rebinding can't redirect it to an internal address), redirects aren't followed, each event has a stable ID for deduplication, and the delivery row is created in the same transaction that settles the payment.
 
 ## Authentication and access control
 
@@ -88,7 +106,7 @@ Safeguards:
 | Area | Tools | Used for |
 |---|---|---|
 | Backend | Python, FastAPI, SQLAlchemy, Pydantic | REST API, validation, data models |
-| Database / cache | PostgreSQL, Alembic, Redis | Source of truth; schema migrations; rate limiting |
+| Database / cache | PostgreSQL, Alembic, Redis | Source of truth; schema migrations; rate limiting and live-update pub/sub |
 | Security | argon2, PyJWT | Password hashing, access tokens |
 | Messaging | Kafka, Amazon SQS | Kafka for payment events (outbox relay, dead-letter topic), SQS for notifications |
 | AWS | boto3, S3, SQS, CloudWatch (metrics, logs, alarms), SNS, IAM, EC2 | Storage, queues, monitoring, hosting |
@@ -189,6 +207,7 @@ The tests cover:
 - that users can't see or touch each other's data, and role rules
 - idempotent payments and refunds, including parallel retries on PostgreSQL
 - the API keeping working when Redis is down
+- live updates and the event stream; webhook signing, SSRF protection, retries and redelivery
 - S3 receipts, SQS messages and CloudWatch metrics
 - Slack delivery, including retries when Slack is down
 - running the AWS setup script twice
@@ -228,6 +247,11 @@ All endpoints except `/`, `/health` and `/auth/*` need a logged-in user.
 | GET | `/reconciliation` | Run the ledger checks now (admins) |
 | GET | `/payments/{id}/receipt` | Receipt read back from S3 |
 | GET | `/notifications` | Notification records and whether they were sent |
+| GET | `/events` | Live updates for your payments and refunds (Server-Sent Events) |
+| GET, PUT, DELETE | `/accounts/{id}/webhook-endpoint` | Merchant webhook URL (the signing secret is returned when first set) |
+| POST | `/accounts/{id}/webhook-endpoint/rotate-secret` | New signing secret |
+| GET | `/accounts/{id}/webhook-deliveries` | Delivery log with attempts and results |
+| POST | `/webhook-deliveries/{id}/retry` | Send a failed delivery again |
 
 List endpoints take `limit` (1–100, default 50) and `offset`.
 | GET | `/health` | Health check (includes a database query) |
@@ -245,6 +269,8 @@ List endpoints take `limit` (1–100, default 50) and `offset`.
 | Event keeps failing | 3 attempts with backoff, then the Kafka dead-letter topic + CloudWatch alarm; replay with `replay_dlq.py` |
 | Malformed event | Sent straight to the dead-letter topic instead of crashing the worker |
 | Redis down | Logged; rate limiting is skipped, everything else works |
+| Merchant's server is down | Webhook retried after 10 s, 30 s, 1 min, 5 min, 15 min, 30 min, 1 h, then marked `FAILED`; the merchant can retry it |
+| Browser loses its live connection | Reconnects automatically and reloads; slow polling continues as a safety net |
 | Client retries a payment after a timeout | Same `Idempotency-Key` returns the original payment; nothing is charged twice |
 | Refresh token stolen and replayed | Detected on reuse; all of that user's sessions are revoked |
 | S3 or SQS down | The committed payment is kept; the event is retried and then dead-lettered, and replaying it finishes only the missing receipt/notification |
@@ -263,6 +289,9 @@ reconcile.py         Ledger checks and stuck-item detection (runs every 5 minute
 outbox.py            Writes events to the outbox table
 relay.py             Publishes outbox events to Kafka
 worker.py            Kafka consumer that settles payments and refunds (retries, dead-letter topic)
+events.py            Live updates: Redis pub/sub to Server-Sent Events
+webhooks.py          Merchant webhooks: signing, SSRF checks, delivery with retries
+examples/            Example webhook receiver that verifies signatures
 replay_dlq.py        Lists or replays dead-lettered events
 notifier.py          SQS consumer that sends Slack messages
 models.py            SQLAlchemy tables: users, refresh_tokens, idempotency_keys, accounts, payments, refunds,

@@ -4,8 +4,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import (
-    JSON, CheckConstraint, DateTime, Enum, ForeignKey, Index, Integer, Numeric, PrimaryKeyConstraint,
-    String, Uuid, text,
+    JSON, Boolean, CheckConstraint, DateTime, Enum, ForeignKey, Index, Integer, Numeric,
+    PrimaryKeyConstraint, String, Uuid, text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -49,6 +49,12 @@ class EntryType(str, enum.Enum):
 class RefundStatus(str, enum.Enum):
     PENDING = "PENDING"
     SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+
+
+class DeliveryStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    DELIVERED = "DELIVERED"
     FAILED = "FAILED"
 
 
@@ -250,3 +256,44 @@ class OutboxEvent(Base):
     last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class WebhookEndpoint(Base):
+    """Where a merchant's server wants payment and refund events sent (one per merchant account)."""
+
+    __tablename__ = "webhook_endpoints"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("accounts.id"), unique=True)
+    url: Mapped[str] = mapped_column(String(500))
+    # Shared secret for the HMAC signature. The merchant needs it to verify events, so it can't be
+    # hashed like a password; it's shown when set and can be rotated.
+    secret: Mapped[str] = mapped_column(String(100))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class WebhookDelivery(Base):
+    """One event to deliver to a merchant's endpoint, with its delivery attempts."""
+
+    __tablename__ = "webhook_deliveries"
+    __table_args__ = (
+        Index("ix_webhook_deliveries_endpoint_created", "endpoint_id", "created_at"),
+        Index("ix_webhook_deliveries_payment_id", "payment_id"),
+    )
+
+    # Derived from the event (e.g. payment X succeeded), so a retried worker can't create it twice.
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
+    endpoint_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("webhook_endpoints.id"))
+    payment_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("payments.id"))
+    refund_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("refunds.id"), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(50))
+    payload: Mapped[dict] = mapped_column(JSON)
+    status: Mapped[DeliveryStatus] = mapped_column(enum_column(DeliveryStatus), default=DeliveryStatus.PENDING)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

@@ -10,6 +10,8 @@ let merchants = [];
 let openPaymentId = null;
 let paymentKey = crypto.randomUUID(); // Idempotency-Key for the payment being entered
 let pollTimer = null;
+let liveConnection = null; // AbortController for the open /events stream
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
@@ -79,6 +81,7 @@ function demoLogins() {
 function signedOut() {
   accessToken = null; me = null;
   clearTimeout(pollTimer);
+  liveConnection?.abort(); $("live").hidden = true;
   $("signed-in").hidden = true; $("signed-out").hidden = false;
   $("logout").hidden = true; $("switch-demo").hidden = true;
   $("whoami").textContent = "";
@@ -95,6 +98,13 @@ async function signedIn() {
   $("pay-card").hidden = me.role !== "CUSTOMER";
   $("top-up-form").hidden = me.role !== "CUSTOMER";
   $("reconciliation-card").hidden = me.role !== "ADMIN";
+  $("webhook-card").hidden = me.role !== "MERCHANT";
+  $("webhook-secret").innerHTML = "";
+  if (me.role === "MERCHANT") {
+    const endpoint = await api(`/accounts/${me.accounts[0].id}/webhook-endpoint`).catch(() => null);
+    $("webhook-url").value = endpoint?.enabled ? endpoint.url : "";
+  }
+  openLiveUpdates();
   $("payments-title").firstChild.textContent = me.role === "MERCHANT" ? "Payments received " : "Payments ";
   $("details").innerHTML = ""; openPaymentId = null;
   if (me.role === "CUSTOMER") {
@@ -132,12 +142,69 @@ async function refresh() {
         <td class="muted">${new Date(p.created_at).toLocaleTimeString()}</td>
       </tr>`).join("") : `<tr><td colspan="7" class="empty">No payments yet.</td></tr>`;
     if (openPaymentId) await showDetails(openPaymentId);
-    // Poll quickly while something is still being processed, slowly otherwise.
+    if (me.role === "MERCHANT") await loadWebhookDeliveries();
+    // With live updates on, the server tells us when something changes; polling is only a
+    // slow safety net. Without them, poll quickly while something is still being processed.
     const busy = payments.some((p) => p.status === "PENDING") || $("details").querySelector(".badge.PENDING");
-    pollTimer = setTimeout(refresh, busy ? 1500 : 15000);
+    pollTimer = setTimeout(refresh, !$("live").hidden ? 30000 : busy ? 1500 : 15000);
   } catch (error) {
     if (me) { say(error.message, true); pollTimer = setTimeout(refresh, 15000); }
   }
+}
+
+// ---------- Live updates (Server-Sent Events over fetch, so the access token can be sent) ----------
+
+async function openLiveUpdates() {
+  liveConnection?.abort();
+  const connection = new AbortController();
+  liveConnection = connection;
+  while (me && !connection.signal.aborted) {
+    try {
+      const response = await fetch("/events", {headers: {Authorization: `Bearer ${accessToken}`}, signal: connection.signal});
+      if (response.status === 401) {
+        if (await refreshSession()) continue;
+        signedOut(); return;
+      }
+      if (!response.ok) throw new Error(response.statusText);
+      $("live").hidden = false;
+      refresh(); // catch up on anything that changed while disconnected
+      const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buffer = "";
+      for (;;) {
+        const {value, done} = await reader.read();
+        if (done) break;
+        buffer += value;
+        let end;
+        while ((end = buffer.indexOf("\n\n")) >= 0) {
+          const block = buffer.slice(0, end);
+          buffer = buffer.slice(end + 2);
+          if (block.startsWith("event: update")) liveUpdate(JSON.parse(block.split("\ndata: ")[1]));
+        }
+      }
+    } catch (error) {
+      if (connection.signal.aborted) return;
+    }
+    $("live").hidden = true;
+    await sleep(2000); // the server ends streams every 10 minutes, or the network dropped
+  }
+}
+
+function liveUpdate(event) {
+  const what = event.type === "refund.updated" ? "Refund" : "Payment";
+  say(`${what} of ₹${event.amount} ${event.status === "SUCCESS" ? "succeeded" : "failed"}${event.failure_reason ? `: ${event.failure_reason}` : ""}.`,
+      event.status !== "SUCCESS");
+  refresh();
+}
+
+// ---------- Merchant webhooks ----------
+
+async function loadWebhookDeliveries() {
+  const deliveries = await api(`/accounts/${me.accounts[0].id}/webhook-deliveries?limit=10`).catch(() => []);
+  $("webhook-deliveries").innerHTML = deliveries.length ? deliveries.map((d) => `
+    <tr><td>${escapeHtml(d.event_type)}</td><td><span class="badge ${d.status === "DELIVERED" ? "SUCCESS" : d.status}">${d.status}</span></td>
+    <td class="num">${d.attempts}</td><td>${escapeHtml(d.last_error || d.last_status_code || "")}</td>
+    <td>${d.status === "FAILED" ? `<button class="secondary" data-retry="${d.id}">Retry</button>` : ""}</td></tr>`).join("")
+    : `<tr><td colspan="5" class="empty">No deliveries yet.</td></tr>`;
 }
 
 async function showDetails(paymentId) {
@@ -269,6 +336,24 @@ $("payments").addEventListener("click", (event) => {
 });
 
 $("run-reconciliation").addEventListener("click", showReconciliation);
+
+$("webhook-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const endpoint = await api(`/accounts/${me.accounts[0].id}/webhook-endpoint`, {method: "PUT", body: {url: $("webhook-url").value}});
+    $("webhook-secret").innerHTML = endpoint.secret
+      ? `<p class="muted">Signing secret (shown once; use it to verify the LedgerFlow-Signature header):</p><pre>${escapeHtml(endpoint.secret)}</pre>`
+      : "";
+    say("Webhook URL saved.");
+  } catch (error) { say(`Webhook not saved: ${error.message}`, true); }
+});
+
+$("webhook-deliveries").addEventListener("click", async (event) => {
+  const id = event.target.dataset.retry;
+  if (!id) return;
+  try { await api(`/webhook-deliveries/${id}/retry`, {method: "POST"}); say("Retrying delivery..."); loadWebhookDeliveries(); }
+  catch (error) { say(error.message, true); }
+});
 
 // On load: resume the session from the refresh cookie, if there is one.
 refreshSession().then((ok) => ok ? signedIn() : signedOut()).catch(() => signedOut());

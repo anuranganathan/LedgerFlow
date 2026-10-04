@@ -13,6 +13,7 @@ AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 AWS_ENDPOINT_URL = os.getenv("AWS_ENDPOINT_URL") or None
 S3_BUCKET = os.getenv("S3_BUCKET", "ledgerflow-receipts")
 SQS_QUEUE_NAME = os.getenv("SQS_QUEUE_NAME", "ledgerflow-notifications")
+WEBHOOK_QUEUE_NAME = os.getenv("WEBHOOK_QUEUE_NAME", "ledgerflow-webhooks")
 METRICS_NAMESPACE = "LedgerFlow"
 
 
@@ -23,8 +24,8 @@ def client(service: str):
 
 
 @cache
-def queue_url() -> str:
-    return client("sqs").get_queue_url(QueueName=SQS_QUEUE_NAME)["QueueUrl"]
+def queue_url(name: str = SQS_QUEUE_NAME) -> str:
+    return client("sqs").get_queue_url(QueueName=name)["QueueUrl"]
 
 
 # ---------- S3: payment receipts ----------
@@ -42,15 +43,15 @@ def read_receipt(key: str) -> dict[str, Any]:
     return json.loads(response["Body"].read())
 
 
-# ---------- SQS: notification queue ----------
+# ---------- SQS: notification and webhook queues ----------
 
-def send_notification(message: dict[str, str]) -> None:
-    client("sqs").send_message(QueueUrl=queue_url(), MessageBody=json.dumps(message))
+def send_message(queue: str, message: dict[str, str]) -> None:
+    client("sqs").send_message(QueueUrl=queue_url(queue), MessageBody=json.dumps(message))
 
 
-def receive_notifications(max_messages: int = 5) -> list[dict[str, Any]]:
+def receive_messages(queue: str, max_messages: int = 5, wait_seconds: int = 10) -> list[dict[str, Any]]:
     response = client("sqs").receive_message(
-        QueueUrl=queue_url(), MaxNumberOfMessages=max_messages, WaitTimeSeconds=10
+        QueueUrl=queue_url(queue), MaxNumberOfMessages=max_messages, WaitTimeSeconds=wait_seconds
     )
     return [
         {"body": json.loads(item["Body"]), "receipt_handle": item["ReceiptHandle"]}
@@ -58,8 +59,27 @@ def receive_notifications(max_messages: int = 5) -> list[dict[str, Any]]:
     ]
 
 
+def delete_message(queue: str, receipt_handle: str) -> None:
+    client("sqs").delete_message(QueueUrl=queue_url(queue), ReceiptHandle=receipt_handle)
+
+
+def retry_later(queue: str, receipt_handle: str, seconds: int) -> None:
+    """Hides the message for a while; SQS delivers it again afterwards (used for backoff)."""
+    client("sqs").change_message_visibility(
+        QueueUrl=queue_url(queue), ReceiptHandle=receipt_handle, VisibilityTimeout=seconds
+    )
+
+
+def send_notification(message: dict[str, str]) -> None:
+    send_message(SQS_QUEUE_NAME, message)
+
+
+def receive_notifications(max_messages: int = 5) -> list[dict[str, Any]]:
+    return receive_messages(SQS_QUEUE_NAME, max_messages)
+
+
 def delete_notification(receipt_handle: str) -> None:
-    client("sqs").delete_message(QueueUrl=queue_url(), ReceiptHandle=receipt_handle)
+    delete_message(SQS_QUEUE_NAME, receipt_handle)
 
 
 # ---------- CloudWatch: custom metrics ----------

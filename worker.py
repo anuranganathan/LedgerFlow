@@ -20,7 +20,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 import aws_services
+import events
 import kafka_client
+import webhooks
 from database import SessionLocal
 from ledger import lock, transfer
 from models import Account, Notification, Payment, PaymentStatus, Refund, RefundStatus, utc_now
@@ -49,6 +51,7 @@ def settle(db: Session, payment: Payment) -> None:
     payment.updated_at = utc_now()
     # Saved in the same transaction as the result, so a notification is never forgotten.
     db.add(Notification(payment_id=payment.id, message=message))
+    webhooks.add_delivery(db, payment, None)
 
 
 def as_utc(value: datetime) -> datetime:
@@ -86,13 +89,15 @@ def process_payment(payment_id: uuid.UUID | str, db: Session) -> Payment | None:
 
 
 def complete_side_effects(db: Session, payment: Payment) -> None:
-    """Queues the notification and stores the receipt, if that hasn't happened yet.
+    """Sends updates, queues the notification and webhook, and stores the receipt, if not done yet.
 
     These run after the money transaction. If one fails, the exception makes the event be
     retried; the money step is then skipped and only the missing side effects are redone.
     """
-    # The notification goes first: telling the customer matters more than the receipt.
+    # Telling people comes first: the live update, Slack, then the merchant's webhook.
+    push_live_update(db, payment, None)
     queue_notification(db, payment, None)
+    webhooks.queue_deliveries(db, payment.id, None)
 
     if payment.status == PaymentStatus.SUCCESS and payment.receipt_s3_key is None:
         payment.receipt_s3_key = aws_services.store_receipt(str(payment.id), {
@@ -105,6 +110,22 @@ def complete_side_effects(db: Session, payment: Payment) -> None:
             "processed_at": as_utc(payment.updated_at).isoformat(),
         })
         db.commit()
+
+
+def push_live_update(db: Session, payment: Payment, refund: Refund | None) -> None:
+    """Tells the customer's and merchant's open dashboards that this payment changed."""
+    owners = db.scalars(select(Account.owner_id).where(
+        Account.id.in_([payment.customer_account_id, payment.merchant_account_id])
+    )).all()
+    subject = refund or payment
+    events.publish(owners, {
+        "type": "refund.updated" if refund else "payment.updated",
+        "payment_id": str(payment.id),
+        "refund_id": str(refund.id) if refund else None,
+        "status": subject.status.value,
+        "amount": str(subject.amount),
+        "failure_reason": subject.failure_reason,
+    })
 
 
 def queue_notification(db: Session, payment: Payment, refund: Refund | None) -> None:
@@ -158,6 +179,7 @@ def process_refund(refund_id: uuid.UUID | str, db: Session) -> Refund | None:
             message = "Refund processed successfully"
         refund.updated_at = utc_now()
         db.add(Notification(payment_id=payment.id, refund_id=refund.id, message=message))
+        webhooks.add_delivery(db, payment, refund)
         db.commit()
         aws_services.put_metric(
             "RefundsSucceeded" if refund.status == RefundStatus.SUCCESS else "RefundsFailed"
@@ -166,7 +188,9 @@ def process_refund(refund_id: uuid.UUID | str, db: Session) -> Refund | None:
     else:
         db.commit()
 
+    push_live_update(db, payment, refund)
     queue_notification(db, payment, refund)
+    webhooks.queue_deliveries(db, payment.id, refund.id)
     return refund
 
 
