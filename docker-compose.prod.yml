@@ -1,11 +1,22 @@
-# Production on AWS EC2. Differences from docker-compose.yml:
+# Production on AWS EC2 (deployed by deploy.sh). Differences from docker-compose.yml:
 #  - real S3, SQS and CloudWatch instead of LocalStack
 #  - AWS credentials come from the EC2 instance's IAM role, so no keys are stored anywhere
-#  - app logs are shipped to CloudWatch Logs (/ledgerflow/app)
-#  - containers restart automatically, and the API is served on port 80
+#  - every app service runs the same image, tagged with the git commit it was built from
+#    (APP_IMAGE), so a deploy runs exactly the tested commit and rollback is just an older tag
+#  - Caddy serves HTTPS with an automatic Let's Encrypt certificate; the API isn't exposed
+#  - logs go to CloudWatch Logs (/ledgerflow/app); every service has a health check
+x-logging: &logging
+  driver: awslogs
+  options:
+    awslogs-region: ${AWS_REGION}
+    awslogs-group: /ledgerflow/app
+    tag: "{{.Name}}"
+
 x-app: &app
+  image: ${APP_IMAGE:-ledgerflow:local}
   build: .
   restart: unless-stopped
+  logging: *logging
   environment:
     DATABASE_URL: postgresql+psycopg2://payflow:${POSTGRES_PASSWORD}@postgres:5432/payflow
     REDIS_URL: redis://redis:6379/0
@@ -26,89 +37,90 @@ x-app: &app
     migrate:
       condition: service_completed_successfully
 
+# Background processes touch a heartbeat file on every loop (see heartbeat.py).
+x-heartbeat: &heartbeat
+  test: ["CMD", "python", "heartbeat.py", "90"]
+  interval: 15s
+  timeout: 5s
+  retries: 3
+  start_period: 60s
+
 services:
   # Applies database migrations once per deploy, then exits.
   migrate:
+    image: ${APP_IMAGE:-ledgerflow:local}
     build: .
     command: alembic upgrade head
     restart: "no"
+    logging: *logging
     environment:
       DATABASE_URL: postgresql+psycopg2://payflow:${POSTGRES_PASSWORD}@postgres:5432/payflow
     depends_on:
       postgres:
         condition: service_healthy
-    logging:
-      driver: awslogs
-      options:
-        awslogs-region: ${AWS_REGION}
-        awslogs-group: /ledgerflow/app
-        awslogs-stream: migrate
 
   api:
     <<: *app
-    command: uvicorn app:app --host 0.0.0.0 --port 8000
-    ports:
-      - "80:8000"
-    logging:
-      driver: awslogs
-      options:
-        awslogs-region: ${AWS_REGION}
-        awslogs-group: /ledgerflow/app
-        awslogs-stream: api
+    # Trust X-Forwarded-For from Caddy (the API is only reachable inside this network), so rate
+    # limits see the real client IP.
+    command: uvicorn app:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=*
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   relay:
     <<: *app
     command: python relay.py
-    logging:
-      driver: awslogs
-      options:
-        awslogs-region: ${AWS_REGION}
-        awslogs-group: /ledgerflow/app
-        awslogs-stream: relay
+    healthcheck: *heartbeat
 
   worker:
     <<: *app
     command: python worker.py
-    logging:
-      driver: awslogs
-      options:
-        awslogs-region: ${AWS_REGION}
-        awslogs-group: /ledgerflow/app
-        awslogs-stream: worker
+    healthcheck: *heartbeat
 
   notifier:
     <<: *app
     command: python notifier.py
-    logging:
-      driver: awslogs
-      options:
-        awslogs-region: ${AWS_REGION}
-        awslogs-group: /ledgerflow/app
-        awslogs-stream: notifier
+    healthcheck: *heartbeat
 
   webhooks:
     <<: *app
     command: python webhooks.py
-    logging:
-      driver: awslogs
-      options:
-        awslogs-region: ${AWS_REGION}
-        awslogs-group: /ledgerflow/app
-        awslogs-stream: webhooks
+    healthcheck: *heartbeat
 
   reconciler:
     <<: *app
     command: python reconcile.py
-    logging:
-      driver: awslogs
-      options:
-        awslogs-region: ${AWS_REGION}
-        awslogs-group: /ledgerflow/app
-        awslogs-stream: reconciler
+    healthcheck:
+      <<: *heartbeat
+      test: ["CMD", "python", "heartbeat.py", "420"]  # runs every 5 minutes
+
+  # HTTPS in front of the API. SITE_ADDRESS is a hostname (Caddy then gets a Let's Encrypt
+  # certificate and redirects http to https) or ":80" for plain HTTP.
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
 
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *logging
     environment:
       POSTGRES_DB: payflow
       POSTGRES_USER: payflow
@@ -124,6 +136,7 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    logging: *logging
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -133,6 +146,7 @@ services:
   kafka:
     image: apache/kafka:3.9.1
     restart: unless-stopped
+    logging: *logging
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -157,3 +171,5 @@ services:
 volumes:
   postgres_data:
   kafka_data:
+  caddy_data:
+  caddy_config:

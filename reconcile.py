@@ -22,6 +22,7 @@ from sqlalchemy import case, delete, func, select
 from sqlalchemy.orm import Session
 
 import aws_services
+import heartbeat
 from database import SessionLocal
 import webhooks
 from models import (
@@ -200,6 +201,7 @@ def run_once() -> dict:
 def run_reconciler() -> None:
     logger.info("Reconciler started; checking every %ds", INTERVAL_SECONDS)
     while True:
+        heartbeat.beat()
         try:
             run_once()
         except Exception:

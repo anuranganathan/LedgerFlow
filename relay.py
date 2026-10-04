@@ -14,6 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 import aws_services
+import heartbeat
 import kafka_client
 from database import SessionLocal
 from models import OutboxEvent, utc_now
@@ -56,6 +57,7 @@ def run_relay() -> None:
     kafka_client.ensure_topics()
     backoff = 1
     while True:
+        heartbeat.beat()
         with SessionLocal() as db:
             try:
                 published = publish_pending(db)

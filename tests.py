@@ -991,3 +991,17 @@ def test_reconciler_queues_deliveries_that_were_never_queued(client, fake_dns, m
         db.commit()
     reconcile.run_once()
     assert len(aws_services.receive_messages(aws_services.WEBHOOK_QUEUE_NAME, wait_seconds=0)) == 1
+
+
+# ---------- Health checks for background processes ----------
+
+def test_heartbeat_reports_stuck_or_missing_processes(tmp_path, monkeypatch):
+    import heartbeat
+
+    monkeypatch.setattr(heartbeat, "HEARTBEAT_FILE", str(tmp_path / "beat"))
+    assert not heartbeat.is_fresh(60)  # never started
+    heartbeat.beat()
+    assert heartbeat.is_fresh(60)
+    old = time.time() - 120
+    os.utime(heartbeat.HEARTBEAT_FILE, (old, old))
+    assert not heartbeat.is_fresh(60)  # stuck for two minutes

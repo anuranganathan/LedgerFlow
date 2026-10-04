@@ -121,19 +121,22 @@ Safeguards:
 The [`Jenkinsfile`](Jenkinsfile) defines the pipeline:
 
 ```
-git push → Jenkins → install deps → pytest → docker build → deploy to EC2 (SSH + deploy.sh) → health check
+git push → Jenkins → unit tests → PostgreSQL tests → image ledgerflow:<commit> → push to ECR
+         → deploy.sh <commit> on EC2 → all containers healthy? → done (or automatic rollback)
 ```
 
-- Test results are published to Jenkins as JUnit reports.
-- The deploy stage runs [`deploy.sh`](deploy.sh) on the server. It pulls the code, rebuilds the containers and fails the build if `/health` doesn't respond.
-- Jenkins itself runs in Docker: `docker compose -f jenkins/docker-compose.yml up -d --build`, then open <http://localhost:8080>.
+- **Two test stages**, both published as JUnit reports: `tests.py`, and `tests_postgres.py` against a throwaway PostgreSQL container (row locks and migrations need the real database).
+- **One image per commit.** Every app service runs the same image, built for arm64 (the server is Graviton) and pushed to **Amazon ECR** with immutable tags, scanned on push, the last 30 kept. The server only pulls, so production runs exactly the commit that passed the tests.
+- **Deploy** ([`deploy.sh`](deploy.sh)) checks out that commit, starts it and waits until every container is healthy: the API answers `/health`, and each background process reports a heartbeat (a stuck worker counts as down). If that doesn't happen within 5 minutes, it **redeploys the last healthy commit** and fails the build. Only `main` is deployed, and builds never run in parallel.
+- Without ECR configured, the server builds the image for that exact commit itself.
+- Jenkins itself runs in Docker: `docker compose -f jenkins/docker-compose.yml up -d --build`, then open <http://localhost:8080>. Set `ECR_REPOSITORY`, `DEPLOY_HOST`, `DEPLOY_USER` and optionally `SITE_URL`, plus the credentials `aws-ecr-push` and `deploy-ssh-key`.
 
 ### AWS automation with Python (boto3)
 
 No AWS resources are created by hand; two scripts create them:
 
 - [`setup_aws.py`](setup_aws.py) creates the S3 bucket (public access blocked), the SQS queue plus a dead-letter queue, a CloudWatch log group, an SNS alert topic and the CloudWatch alarm. It's idempotent, so running it again changes nothing. Locally it runs against LocalStack automatically on `docker compose up`.
-- [`provision_ec2.py`](provision_ec2.py) builds the server: an IAM role, an SSH key pair, a security group, an EC2 instance and an Elastic IP. The server installs Docker on first boot and deploys itself. `python provision_ec2.py destroy` removes the server to stop charges.
+- [`provision_ec2.py`](provision_ec2.py) builds the server: an IAM role, an ECR repository, an SSH key pair, a security group, an Elastic IP and an EC2 instance. The server installs Docker on first boot and deploys itself. `python provision_ec2.py destroy` removes the server to stop charges.
 
 ### Monitoring (CloudWatch)
 
@@ -154,7 +157,9 @@ No AWS resources are created by hand; two scripts create them:
 
 - The EC2 server gets AWS access through an **IAM role**, so no access keys exist on the server or in the repo.
 - The role follows **least privilege**: it only gets `PutObject`/`GetObject` on the one bucket, send/receive/delete on the one queue, metrics limited to the `LedgerFlow` namespace, and writes to the one log group.
-- The security group opens HTTP to everyone but **SSH only to the admin's IP**. The server uses IMDSv2.
+- **HTTPS**: Caddy gets and renews a Let's Encrypt certificate automatically (the server is reachable as `<ip-with-dashes>.sslip.io` without buying a domain), redirects HTTP to HTTPS and sends HSTS. Session cookies are `Secure`. The API container isn't exposed; only Caddy is.
+- The security group opens HTTP/HTTPS to everyone but **SSH only to the admin's IP**. The server uses IMDSv2.
+- The server can only **pull** images from ECR; pushing needs the separate CI credential.
 - The S3 bucket blocks all public access. Secrets such as the database password and Slack webhook live in a `.env` file that is never committed.
 
 ## Run locally
@@ -305,19 +310,27 @@ aws_services.py      boto3 helpers for S3, SQS and CloudWatch
 slack_client.py      Slack webhook client
 setup_aws.py         Creates S3 / SQS / CloudWatch / SNS resources
 provision_ec2.py     Creates IAM role, security group and EC2 server
-deploy.sh            Deploy script run on the server
+deploy.sh            Deploys one commit on the server, health-checks it, rolls back on failure
+heartbeat.py         Health checks for the background processes
+Caddyfile            HTTPS reverse proxy
+ci/ecr.py            ECR login and tag check for Jenkins
 static/              Dashboard (index.html, app.js, style.css)
 tests.py             pytest suite (SQLite + moto)
 tests_postgres.py    Concurrency and migration tests on PostgreSQL
 Jenkinsfile          CI/CD pipeline
 jenkins/             Jenkins in Docker
 docker-compose.yml       Local stack (with LocalStack)
-docker-compose.prod.yml  Production stack on EC2 (real AWS)
+docker-compose.prod.yml  Production stack on EC2 (real AWS, HTTPS, health checks)
 ```
 
 ## Limitations and next steps
 
-- One EC2 instance runs everything. In production I'd use managed services (RDS for PostgreSQL, ElastiCache for Redis, MSK for Kafka) and run the app on ECS.
-- Jenkins builds the image, but the server also rebuilds it. Pushing a versioned image to Amazon ECR would make deploys faster and rollbacks easy.
-- The demo is served over plain HTTP, with no domain or TLS.
-- Infrastructure is scripted with boto3. Terraform or CloudFormation would add drift detection and plan/apply reviews.
+These are deliberate trade-offs for a single-server demo:
+
+- **One EC2 instance runs everything**, including a single Kafka broker (no replicas) and PostgreSQL without automated backups. In production I'd use managed services: MSK with 3 replicas, RDS with point-in-time recovery, ElastiCache, and the app on ECS behind a load balancer.
+- **Deploys briefly restart the containers** (seconds of downtime). Blue/green or rolling deploys need more than one server.
+- **Rollback assumes backward-compatible migrations** (add columns/tables; drop them a release later). A destructive migration would need a restore.
+- **Webhook signing secrets are stored in the database as-is** (they must be readable to sign); in production they'd be encrypted with AWS KMS.
+- **Customers are notified in the app** (live updates) and merchants via webhooks; there's no email or SMS.
+- **Infrastructure is scripted with boto3.** Terraform or CloudFormation would add drift detection and reviewed plans.
+- **It's a simulation**: no real banks, cards, KYC or regulatory reporting.

@@ -36,6 +36,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 import aws_services
+import heartbeat
 from database import SessionLocal
 from models import DeliveryStatus, Payment, Refund, WebhookDelivery, WebhookEndpoint, utc_now
 
@@ -199,6 +200,7 @@ def attempt(endpoint: WebhookEndpoint, delivery: WebhookDelivery) -> tuple[bool,
 def run_sender() -> None:
     logger.info("Webhook sender started")
     while True:
+        heartbeat.beat()
         try:
             messages = aws_services.receive_messages(aws_services.WEBHOOK_QUEUE_NAME)
         except Exception as exc:
