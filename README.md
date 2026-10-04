@@ -12,7 +12,7 @@ LedgerFlow is an event-driven payment processing system built with a focus on re
 flowchart LR
     Client[Dashboard / REST client] --> API[FastAPI]
     API -- payment + outbox event<br/>in one transaction --> DB[(PostgreSQL)]
-    API --> Cache[(Redis)]
+    API -- rate limits --> Cache[(Redis)]
     DB --> Relay[Outbox relay]
     Relay -- PAYMENT_CREATED --> Kafka[[Kafka]]
     Kafka --> Worker[Payment worker]
@@ -51,6 +51,20 @@ Every step can crash or find a dependency down, so each hand-off is designed to 
 
 These are covered by tests, including concurrency tests on real PostgreSQL (`tests_postgres.py`).
 
+## Authentication and access control
+
+| Piece | How it works |
+|---|---|
+| Users and roles | `POST /auth/register` creates a CUSTOMER or MERCHANT user and their first account. Admins can't sign up; they're created with `python create_admin.py <email>`. |
+| Passwords | Hashed with **argon2**. Login answers the same way (and takes as long) for a wrong password and an unknown email, so it doesn't reveal who is registered. |
+| Access tokens | **JWT**, HS256, valid 15 minutes, sent as `Authorization: Bearer ...`. The user and role are re-read from the database on every request. |
+| Sessions | A random **refresh token** in an `HttpOnly`, `SameSite=Strict` cookie (JavaScript can't read it; `Secure` when served over HTTPS). Only its SHA-256 hash is stored. Each refresh token works once and is replaced (**rotation**); presenting a used one again revokes every session of that user. |
+| Ownership | Customers pay only from their own account and see only their own payments; merchants see payments they received and can refund only those; admins see everything and run reconciliation. Other users' data returns `404`, so its existence isn't revealed. |
+| Idempotency | `POST /payments` and refunds accept an `Idempotency-Key` header. The response is saved with the payment in one transaction; a retry gets the same response (`Idempotent-Replayed: true`), and reusing a key for a different request is rejected. The dashboard sends one with every payment. |
+| Rate limits (Redis) | Login 5 per email per 5 minutes and 20 per IP per minute; sign-up 20 per IP per hour; payments and refunds 30 per user per minute; top-ups 10 per minute. If Redis is down, requests are allowed and the failure is logged. |
+| Demo money | Customers can top up their own account (at most ₹10,000 at a time and ₹50,000 per 24 hours). A real system would take this money from a card or bank transfer. |
+| Browser security | Content-Security-Policy (only the dashboard's own script can run), `X-Frame-Options: DENY`, `nosniff`, `no-referrer`. |
+
 ## The ledger
 
 Every change to a balance is a **double-entry transfer** written by `ledger.py`: one DEBIT and one CREDIT of the same amount, in the same transaction as the balance update.
@@ -74,7 +88,8 @@ Safeguards:
 | Area | Tools | Used for |
 |---|---|---|
 | Backend | Python, FastAPI, SQLAlchemy, Pydantic | REST API, validation, data models |
-| Database / cache | PostgreSQL, Alembic, Redis | Source of truth; schema migrations; short-lived payment status cache |
+| Database / cache | PostgreSQL, Alembic, Redis | Source of truth; schema migrations; rate limiting |
+| Security | argon2, PyJWT | Password hashing, access tokens |
 | Messaging | Kafka, Amazon SQS | Kafka for payment events (outbox relay, dead-letter topic), SQS for notifications |
 | AWS | boto3, S3, SQS, CloudWatch (metrics, logs, alarms), SNS, IAM, EC2 | Storage, queues, monitoring, hosting |
 | DevOps | Docker, Docker Compose, Jenkins, LocalStack | Containers, CI/CD, local AWS |
@@ -133,7 +148,7 @@ cp .env.example .env        # optional: add a Slack webhook URL
 docker compose up --build
 ```
 
-Open <http://localhost:8000> and click **Create demo accounts**, then send a payment. Try an amount larger than the balance to see a `FAILED` payment. Swagger UI is at <http://localhost:8000/docs>.
+Open <http://localhost:8000> and click **Try the demo**: it creates a customer with ₹5000 and a merchant, and logs you in as the customer. Pay the store, try an amount larger than the balance to see a `FAILED` payment, then **Switch to merchant view** to refund. Swagger UI is at <http://localhost:8000/docs> (register with `POST /auth/register`, then click **Authorize**). For an admin: `docker compose exec api python create_admin.py you@example.com`.
 
 Everything runs locally, including AWS: LocalStack emulates S3, SQS, CloudWatch and SNS, and `setup_aws.py` provisions them on startup. The `migrate` service applies database migrations before the app starts. If port 8000 is taken, run `API_PORT=8001 docker compose up --build`. Without a Slack webhook, the notifier logs the Slack message instead (`docker compose logs notifier`).
 
@@ -170,7 +185,10 @@ The tests cover:
 - duplicate events and crash recovery, without moving money twice
 - concurrent payments, top-ups and refund requests on PostgreSQL
 - top-ups and refunds in the ledger, validation, database constraints and reconciliation
-- Redis fallback
+- login, token rotation and reuse detection, forged and expired tokens, rate limits
+- that users can't see or touch each other's data, and role rules
+- idempotent payments and refunds, including parallel retries on PostgreSQL
+- the API keeping working when Redis is down
 - S3 receipts, SQS messages and CloudWatch metrics
 - Slack delivery, including retries when Slack is down
 - running the AWS setup script twice
@@ -188,18 +206,26 @@ Reason: Insufficient balance
 
 ## API
 
+All endpoints except `/`, `/health` and `/auth/*` need a logged-in user.
+
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/accounts` | Create a customer or merchant account |
-| GET | `/accounts`, `/accounts/{id}` | List or get accounts |
-| POST | `/accounts/{id}/fund` | Top up an account (recorded in the ledger) |
+| POST | `/auth/register` | Sign up as a customer or merchant |
+| POST | `/auth/login` | Log in (form fields `username` = email, `password`); returns an access token and sets the session cookie |
+| POST | `/auth/refresh` | New access token from the session cookie |
+| POST | `/auth/logout`, `/auth/logout-everywhere` | End this session, or all of them |
+| GET | `/auth/me` | The logged-in user and their accounts |
+| POST | `/accounts` | Open another account (type follows your role) |
+| GET | `/accounts`, `/accounts/{id}` | Your accounts (admins: all) |
+| GET | `/merchants` | Merchants a customer can pay |
+| POST | `/accounts/{id}/fund` | Top up your account, or any account as admin (recorded in the ledger) |
 | GET | `/accounts/{id}/ledger` | Account statement: its ledger entries |
-| POST | `/payments` | Create a payment (returns `202` + `PENDING`) |
+| POST | `/payments` | Pay a merchant (returns `202` + `PENDING`; supports `Idempotency-Key`) |
 | GET | `/payments`, `/payments/{id}` | List or get payments |
 | GET | `/payments/{id}/ledger` | Double-entry ledger lines for a payment and its refunds |
 | POST | `/payments/{id}/refunds` | Refund all or part of a payment (returns `202` + `PENDING`) |
 | GET | `/payments/{id}/refunds`, `/refunds/{id}` | List or get refunds |
-| GET | `/reconciliation` | Run the ledger checks now |
+| GET | `/reconciliation` | Run the ledger checks now (admins) |
 | GET | `/payments/{id}/receipt` | Receipt read back from S3 |
 | GET | `/notifications` | Notification records and whether they were sent |
 
@@ -218,7 +244,9 @@ List endpoints take `limit` (1–100, default 50) and `offset`.
 | Same Kafka event delivered twice | Money moves once; missing side effects are completed, existing ones aren't repeated |
 | Event keeps failing | 3 attempts with backoff, then the Kafka dead-letter topic + CloudWatch alarm; replay with `replay_dlq.py` |
 | Malformed event | Sent straight to the dead-letter topic instead of crashing the worker |
-| Redis down | Logged; reads fall back to PostgreSQL |
+| Redis down | Logged; rate limiting is skipped, everything else works |
+| Client retries a payment after a timeout | Same `Idempotency-Key` returns the original payment; nothing is charged twice |
+| Refresh token stolen and replayed | Detected on reuse; all of that user's sessions are revoked |
 | S3 or SQS down | The committed payment is kept; the event is retried and then dead-lettered, and replaying it finishes only the missing receipt/notification |
 | Slack down | Message stays in SQS and is retried, then moves to the dead-letter queue |
 | CloudWatch down | Metric is skipped; payment processing continues |
@@ -226,7 +254,10 @@ List endpoints take `limit` (1–100, default 50) and `offset`.
 ## Project structure
 
 ```text
-app.py               FastAPI app and endpoints
+app.py               FastAPI app, endpoints and access control
+auth.py              Password hashing, JWT access tokens, refresh-token sessions
+idempotency.py       Idempotency-Key handling
+create_admin.py      Creates an admin user
 ledger.py            Double-entry transfers, top-ups and row locking
 reconcile.py         Ledger checks and stuck-item detection (runs every 5 minutes)
 outbox.py            Writes events to the outbox table
@@ -234,18 +265,19 @@ relay.py             Publishes outbox events to Kafka
 worker.py            Kafka consumer that settles payments and refunds (retries, dead-letter topic)
 replay_dlq.py        Lists or replays dead-lettered events
 notifier.py          SQS consumer that sends Slack messages
-models.py            SQLAlchemy tables: accounts, payments, refunds, top_ups, ledger_entries, notifications, outbox_events
+models.py            SQLAlchemy tables: users, refresh_tokens, idempotency_keys, accounts, payments, refunds,
+                     top_ups, ledger_entries, notifications, outbox_events
 migrations/          Alembic database migrations
 schemas.py           Pydantic request/response models
 database.py          Database engine and sessions
 kafka_client.py      Kafka producer/consumer
-redis_client.py      Payment status cache
+redis_client.py      Rate limiting
 aws_services.py      boto3 helpers for S3, SQS and CloudWatch
 slack_client.py      Slack webhook client
 setup_aws.py         Creates S3 / SQS / CloudWatch / SNS resources
 provision_ec2.py     Creates IAM role, security group and EC2 server
 deploy.sh            Deploy script run on the server
-static/index.html    Dashboard
+static/              Dashboard (index.html, app.js, style.css)
 tests.py             pytest suite (SQLite + moto)
 tests_postgres.py    Concurrency and migration tests on PostgreSQL
 Jenkinsfile          CI/CD pipeline
@@ -259,5 +291,4 @@ docker-compose.prod.yml  Production stack on EC2 (real AWS)
 - One EC2 instance runs everything. In production I'd use managed services (RDS for PostgreSQL, ElastiCache for Redis, MSK for Kafka) and run the app on ECS.
 - Jenkins builds the image, but the server also rebuilds it. Pushing a versioned image to Amazon ECR would make deploys faster and rollbacks easy.
 - The demo is served over plain HTTP, with no domain or TLS.
-- There is no authentication, and no idempotency keys on `POST /payments`.
 - Infrastructure is scripted with boto3. Terraform or CloudFormation would add drift detection and plan/apply reviews.

@@ -6,17 +6,19 @@ os.environ["DATABASE_URL"] = "sqlite:///./test_payflow.db"
 os.environ.pop("AWS_ENDPOINT_URL", None)
 os.environ["AWS_ACCESS_KEY_ID"] = "testing"
 os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
+os.environ["JWT_SECRET"] = "test-secret-that-is-long-enough-for-hs256"
 
+import fakeredis
 import pytest
 from fastapi.testclient import TestClient
 from moto import mock_aws
 from sqlalchemy import select
 
-import app as app_module
 import aws_services
 import kafka_client
 import notifier
 import reconcile
+import redis_client
 import relay
 import setup_aws
 import worker
@@ -32,9 +34,9 @@ from models import (
 def clean_environment(monkeypatch):
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
-    monkeypatch.setattr(app_module, "set_payment_status", lambda *_: None)
-    monkeypatch.setattr(worker, "set_payment_status", lambda *_: None)
+    monkeypatch.setattr(redis_client, "client", fakeredis.FakeRedis(decode_responses=True))
     monkeypatch.setattr(worker, "RETRY_BASE_SECONDS", 0)
+    ACTORS.clear()
     # moto fakes AWS in memory, so the real setup script creates the bucket and queues.
     aws_services.client.cache_clear()
     aws_services.queue_url.cache_clear()
@@ -52,13 +54,33 @@ def client():
         yield test_client
 
 
+PASSWORD = "correct horse battery"
+ACTORS: dict[str, dict] = {}  # account ID -> the user who owns it (with their auth headers)
+
+
+def signup(client: TestClient, role: str = "CUSTOMER") -> dict:
+    """Registers and logs in a user. Returns their account, plus "headers" and "email"."""
+    email = f"{role.lower()}-{uuid.uuid4().hex[:8]}@example.com"
+    assert client.post("/auth/register", json={
+        "email": email, "password": PASSWORD, "name": role.title(), "role": role,
+    }).status_code == 201
+    token = client.post("/auth/login", data={"username": email, "password": PASSWORD}).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    account = client.get("/auth/me", headers=headers).json()["accounts"][0]
+    actor = {**account, "headers": headers, "email": email}
+    ACTORS[account["id"]] = actor
+    return actor
+
+
+def act_as(client: TestClient, actor: dict) -> None:
+    client.headers.update(actor["headers"])
+
+
 def create_accounts(client: TestClient):
-    customer = client.post(
-        "/accounts", json={"name": "Customer", "account_type": "CUSTOMER", "currency": "INR"}
-    ).json()
-    merchant = client.post(
-        "/accounts", json={"name": "Merchant", "account_type": "MERCHANT", "currency": "INR"}
-    ).json()
+    """A customer and a merchant; the client is left logged in as the customer."""
+    merchant = signup(client, "MERCHANT")
+    customer = signup(client, "CUSTOMER")
+    act_as(client, customer)
     return customer, merchant
 
 
@@ -85,12 +107,11 @@ def test_health(client):
     assert client.get("/health").json() == {"status": "ok"}
 
 
-def test_create_customer_account(client):
-    response = client.post(
-        "/accounts", json={"name": "Ananya", "account_type": "CUSTOMER", "currency": "INR"}
-    )
-    assert response.status_code == 201
-    assert response.json()["balance"] == "0.00"
+def test_registering_creates_an_empty_account_for_the_role(client):
+    customer = signup(client, "CUSTOMER")
+    merchant = signup(client, "MERCHANT")
+    assert (customer["account_type"], customer["balance"]) == ("CUSTOMER", "0.00")
+    assert merchant["account_type"] == "MERCHANT"
 
 
 def test_fund_account(client):
@@ -136,12 +157,13 @@ def test_success_creates_debit_and_credit_ledger_entries(client):
         assert all(entry.amount == Decimal("250.00") for entry in entries)
 
 
-def test_redis_failure_falls_back_to_postgresql(client, monkeypatch):
-    response, _, _ = create_payment(client)
-    monkeypatch.setattr(app_module, "get_payment_status", lambda _: None)
-    result = client.get(f"/payments/{response.json()['payment_id']}")
-    assert result.status_code == 200
-    assert result.json()["status"] == "PENDING"
+def test_api_keeps_working_when_redis_is_down(client, monkeypatch):
+    import redis
+
+    monkeypatch.setattr(redis_client, "client", redis.Redis(host="localhost", port=1))  # nothing listens
+    response, _, _ = create_payment(client)  # rate limiting fails open
+    assert response.status_code == 202
+    assert client.get(f"/payments/{response.json()['payment_id']}").json()["status"] == "PENDING"
 
 
 def test_successful_payment_stores_receipt_in_s3(client):
@@ -407,7 +429,9 @@ def settle(payment_id) -> None:
 
 
 def refund(client: TestClient, payment_id: str, **body):
-    response = client.post(f"/payments/{payment_id}/refunds", json=body)
+    """Requested by the merchant who was paid."""
+    merchant_id = client.get(f"/payments/{payment_id}").json()["merchant_account_id"]
+    response = client.post(f"/payments/{payment_id}/refunds", json=body, headers=ACTORS[merchant_id]["headers"])
     if response.status_code == 202:
         with SessionLocal() as db:
             worker.process_refund(response.json()["id"], db)
@@ -421,7 +445,7 @@ def test_top_up_is_recorded_in_the_ledger_against_the_system_account(client):
     assert [(e["entry_type"], e["amount"]) for e in statement] == [("CREDIT", "750.00")]
     assert statement[0]["top_up_id"] is not None
     # The system account is internal: it isn't listed.
-    assert {a["account_type"] for a in client.get("/accounts").json()} == {"CUSTOMER", "MERCHANT"}
+    assert [a["account_type"] for a in client.get("/accounts").json()] == ["CUSTOMER"]
     with SessionLocal() as db:
         assert reconcile.run_checks(db)["ok"]
 
@@ -441,8 +465,11 @@ def test_invalid_payment_amounts_and_currencies_are_rejected(client, body, field
     assert response.json()["detail"][0]["loc"][-1] == field
 
 
-def test_system_accounts_cannot_be_created_through_the_api(client):
-    response = client.post("/accounts", json={"name": "Sneaky", "account_type": "SYSTEM"})
+@pytest.mark.parametrize("role", ["SYSTEM", "ADMIN"])
+def test_system_and_admin_users_cannot_sign_up(client, role):
+    response = client.post("/auth/register", json={
+        "email": "sneaky@example.com", "password": PASSWORD, "name": "Sneaky", "role": role,
+    })
     assert response.status_code == 422
 
 
@@ -466,7 +493,8 @@ def test_full_refund_returns_the_money_and_is_recorded(client):
     payment = client.get(f"/payments/{payment_id}").json()
     assert payment["refunded_amount"] == "500.00"
     assert client.get(f"/accounts/{payment['customer_account_id']}").json()["balance"] == "1000.00"
-    assert client.get(f"/accounts/{payment['merchant_account_id']}").json()["balance"] == "0.00"
+    merchant = ACTORS[payment["merchant_account_id"]]
+    assert client.get(f"/accounts/{merchant['id']}", headers=merchant["headers"]).json()["balance"] == "0.00"
     ledger = client.get(f"/payments/{payment_id}/ledger").json()
     assert len(ledger) == 4 and sum(1 for e in ledger if e["refund_id"]) == 2
     with SessionLocal() as db:
@@ -543,8 +571,217 @@ def test_reconciliation_publishes_metrics(client):
 
 
 def test_lists_are_paginated(client):
+    customer, merchant = create_accounts(client)
     for _ in range(3):
-        create_payment(client)
+        client.post("/payments", json={
+            "customer_account_id": customer["id"], "merchant_account_id": merchant["id"], "amount": "1",
+        })
     assert len(client.get("/payments?limit=2").json()) == 2
     assert len(client.get("/payments?limit=2&offset=2").json()) == 1
     assert client.get("/payments?limit=1000").status_code == 422
+
+
+# ---------- Authentication and authorization ----------
+
+def login_response(client: TestClient, email: str, password: str = PASSWORD):
+    return client.post("/auth/login", data={"username": email, "password": password})
+
+
+def test_endpoints_require_a_login(client):
+    for method, path in [("get", "/payments"), ("get", "/accounts"), ("post", "/payments"),
+                         ("get", "/notifications"), ("get", "/merchants"), ("get", "/auth/me")]:
+        assert getattr(client, method)(path).status_code == 401, path
+
+
+def test_passwords_are_stored_hashed(client):
+    customer = signup(client)
+    with SessionLocal() as db:
+        from models import User
+        stored = db.scalars(select(User)).one().password_hash
+    assert PASSWORD not in stored and stored.startswith("$argon2")
+    assert login_response(client, customer["email"]).status_code == 200
+
+
+def test_wrong_password_and_unknown_email_get_the_same_answer(client):
+    customer = signup(client)
+    wrong = login_response(client, customer["email"], "wrong password!")
+    unknown = login_response(client, "nobody@example.com")
+    assert wrong.status_code == unknown.status_code == 401
+    assert wrong.json() == unknown.json()
+
+
+def test_duplicate_email_is_rejected(client):
+    customer = signup(client)
+    response = client.post("/auth/register", json={
+        "email": customer["email"].upper(), "password": PASSWORD, "name": "Again", "role": "CUSTOMER",
+    })
+    assert response.status_code == 409
+
+
+def test_login_is_rate_limited_per_email(client):
+    customer = signup(client)
+    for _ in range(4):  # the signup's own login was the first attempt
+        assert login_response(client, customer["email"], "wrong password!").status_code == 401
+    blocked = login_response(client, customer["email"])
+    assert blocked.status_code == 429 and int(blocked.headers["Retry-After"]) > 0
+
+
+@pytest.mark.parametrize("token", [
+    "not-a-jwt",
+    # Signed with a different secret.
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIiwidHlwZSI6ImFjY2VzcyIsImV4cCI6OTk5OTk5OTk5OX0.bm90LXRoZS1yaWdodC1zaWc",
+])
+def test_forged_tokens_are_rejected(client, token):
+    assert client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).status_code == 401
+
+
+def test_expired_and_unsigned_tokens_are_rejected(client):
+    import jwt
+
+    import auth
+
+    customer = signup(client)
+    user_id = client.get("/auth/me", headers=customer["headers"]).json()["id"]
+    expired = jwt.encode({"sub": user_id, "type": "access", "exp": 1}, auth.JWT_SECRET, algorithm="HS256")
+    unsigned = jwt.encode({"sub": user_id, "type": "access", "exp": 9999999999}, None, algorithm="none")
+    for token in [expired, unsigned]:
+        assert client.get("/auth/me", headers={"Authorization": f"Bearer {token}"}).status_code == 401
+
+
+def test_refresh_token_rotates_and_reuse_revokes_every_session(client):
+    import auth
+
+    customer = signup(client)
+    first = client.cookies.get(auth.REFRESH_COOKIE)
+    refreshed = client.post("/auth/refresh")
+    assert refreshed.status_code == 200 and refreshed.json()["access_token"]
+    second = client.cookies.get(auth.REFRESH_COOKIE)
+    assert second and second != first
+    # Someone replays the old (already used) token: all sessions end, including the new one.
+    client.cookies.set(auth.REFRESH_COOKIE, first, path="/auth")
+    assert client.post("/auth/refresh").status_code == 401
+    client.cookies.set(auth.REFRESH_COOKIE, second, path="/auth")
+    assert client.post("/auth/refresh").status_code == 401
+    assert login_response(client, customer["email"]).status_code == 200  # logging in again works
+
+
+def test_logout_ends_the_session(client):
+    import auth
+
+    signup(client)
+    token = client.cookies.get(auth.REFRESH_COOKIE)
+    assert client.post("/auth/logout").status_code == 204
+    client.cookies.set(auth.REFRESH_COOKIE, token, path="/auth")
+    assert client.post("/auth/refresh").status_code == 401
+
+
+def test_users_cannot_see_each_others_data(client):
+    payment_id = funded_payment(client)
+    settle(payment_id)
+    stranger = signup(client, "CUSTOMER")
+    other_merchant = signup(client, "MERCHANT")
+    owner = client.get(f"/payments/{payment_id}").json()
+    for actor in [stranger, other_merchant]:
+        for path in [f"/payments/{payment_id}", f"/payments/{payment_id}/ledger",
+                     f"/payments/{payment_id}/receipt", f"/payments/{payment_id}/refunds",
+                     f"/accounts/{owner['customer_account_id']}",
+                     f"/accounts/{owner['customer_account_id']}/ledger"]:
+            assert client.get(path, headers=actor["headers"]).status_code == 404, path
+        assert client.get("/payments", headers=actor["headers"]).json() == []
+        assert client.get("/notifications", headers=actor["headers"]).json() == []
+    # The merchant who was paid sees the payment.
+    merchant = ACTORS[owner["merchant_account_id"]]
+    assert [p["id"] for p in client.get("/payments", headers=merchant["headers"]).json()] == [payment_id]
+
+
+def test_customers_can_only_pay_from_their_own_account(client):
+    victim, merchant = create_accounts(client)
+    thief = signup(client, "CUSTOMER")
+    response = client.post("/payments", headers=thief["headers"], json={
+        "customer_account_id": victim["id"], "merchant_account_id": merchant["id"], "amount": "10",
+    })
+    assert response.status_code == 404
+    top_up = client.post(f"/accounts/{victim['id']}/fund", headers=thief["headers"], json={"amount": "10"})
+    assert top_up.status_code == 404
+
+
+def test_roles_limit_what_users_can_do(client):
+    customer, merchant = create_accounts(client)
+    as_merchant = {"headers": merchant["headers"]}
+    pay = client.post("/payments", **as_merchant, json={
+        "customer_account_id": customer["id"], "merchant_account_id": merchant["id"], "amount": "10",
+    })
+    assert pay.status_code == 403
+    assert client.post(f"/accounts/{merchant['id']}/fund", **as_merchant, json={"amount": "10"}).status_code == 403
+    assert client.get("/reconciliation").status_code == 403
+
+
+def test_customers_cannot_refund_and_other_merchants_cannot_see_the_payment(client):
+    payment_id = funded_payment(client)
+    settle(payment_id)
+    assert client.post(f"/payments/{payment_id}/refunds", json={}).status_code == 403
+    other = signup(client, "MERCHANT")
+    assert client.post(f"/payments/{payment_id}/refunds", json={}, headers=other["headers"]).status_code == 404
+
+
+def test_customer_top_ups_are_limited(client):
+    customer, _ = create_accounts(client)
+    fund = lambda amount: client.post(f"/accounts/{customer['id']}/fund", json={"amount": amount})  # noqa: E731
+    assert fund("10000.01").status_code == 400
+    for _ in range(5):
+        assert fund("10000.00").status_code == 200
+    assert fund("0.01").status_code == 400  # 50,000 in 24 hours
+
+
+def test_admins_see_everything_and_can_run_reconciliation(client, monkeypatch):
+    import create_admin
+
+    funded_payment(client)
+    signup(client)
+    monkeypatch.setenv("ADMIN_PASSWORD", "admin password 123")
+    create_admin.main("admin@example.com")
+    token = login_response(client, "admin@example.com", "admin password 123").json()["access_token"]
+    admin = {"Authorization": f"Bearer {token}"}
+    assert len(client.get("/payments", headers=admin).json()) == 1
+    assert len(client.get("/accounts", headers=admin).json()) == 3
+    assert client.get("/reconciliation", headers=admin).json()["ok"] is True
+
+
+def test_same_idempotency_key_returns_the_first_payment(client):
+    customer, merchant = create_accounts(client)
+    body = {"customer_account_id": customer["id"], "merchant_account_id": merchant["id"], "amount": "25.00"}
+    first = client.post("/payments", json=body, headers={"Idempotency-Key": "order-42"})
+    retry = client.post("/payments", json=body, headers={"Idempotency-Key": "order-42"})
+    assert first.status_code == retry.status_code == 202
+    assert retry.json()["payment_id"] == first.json()["payment_id"]
+    assert retry.headers["Idempotent-Replayed"] == "true"
+    assert retry.headers["Location"] == first.headers["Location"]
+    assert len(client.get("/payments").json()) == 1
+    with SessionLocal() as db:
+        assert len(db.scalars(select(OutboxEvent)).all()) == 1
+    changed = client.post("/payments", json={**body, "amount": "26.00"}, headers={"Idempotency-Key": "order-42"})
+    assert changed.status_code == 422
+    # Keys belong to one user: another customer's "order-42" is a different payment.
+    other = signup(client)
+    other_body = {**body, "customer_account_id": other["id"]}
+    assert client.post("/payments", json=other_body, headers={**other["headers"], "Idempotency-Key": "order-42"}).json()[
+        "payment_id"] != first.json()["payment_id"]
+
+
+def test_refunds_accept_idempotency_keys(client):
+    payment_id = funded_payment(client)
+    settle(payment_id)
+    merchant = ACTORS[client.get(f"/payments/{payment_id}").json()["merchant_account_id"]]
+    headers = {**merchant["headers"], "Idempotency-Key": "refund-1"}
+    first = client.post(f"/payments/{payment_id}/refunds", json={"amount": "100"}, headers=headers)
+    retry = client.post(f"/payments/{payment_id}/refunds", json={"amount": "100"}, headers=headers)
+    assert first.json()["id"] == retry.json()["id"]
+    assert len(client.get(f"/payments/{payment_id}/refunds").json()) == 1
+
+
+def test_dashboard_is_served_with_security_headers(client):
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "script-src 'self'" in response.headers["Content-Security-Policy"]
+    assert response.headers["X-Frame-Options"] == "DENY"
+    assert client.get("/static/app.js").status_code == 200

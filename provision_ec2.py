@@ -134,6 +134,7 @@ cat > /home/ec2-user/LedgerFlow/.env <<EOF
 AWS_REGION={AWS_REGION}
 S3_BUCKET={BUCKET}
 POSTGRES_PASSWORD={secrets.token_urlsafe(24)}
+JWT_SECRET={secrets.token_hex(32)}
 SLACK_WEBHOOK_URL=
 EOF
 chown ec2-user:ec2-user /home/ec2-user/LedgerFlow/.env

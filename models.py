@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import (
-    JSON, CheckConstraint, DateTime, Enum, ForeignKey, Index, Integer, Numeric, String, Uuid, text,
+    JSON, CheckConstraint, DateTime, Enum, ForeignKey, Index, Integer, Numeric, PrimaryKeyConstraint,
+    String, Uuid, text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -18,6 +19,12 @@ def utc_now() -> datetime:
 def enum_column(enum_class: type[enum.Enum]) -> Enum:
     # A fixed length keeps the column the same size on SQLite when enum values change.
     return Enum(enum_class, length=20)
+
+
+class UserRole(str, enum.Enum):
+    CUSTOMER = "CUSTOMER"
+    MERCHANT = "MERCHANT"
+    ADMIN = "ADMIN"
 
 
 class AccountType(str, enum.Enum):
@@ -50,14 +57,61 @@ class NotificationStatus(str, enum.Enum):
     SENT = "SENT"
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    email: Mapped[str] = mapped_column(String(254), unique=True)  # stored lowercase
+    name: Mapped[str] = mapped_column(String(100))
+    password_hash: Mapped[str] = mapped_column(String(200))  # argon2, never the password itself
+    role: Mapped[UserRole] = mapped_column(enum_column(UserRole))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class RefreshToken(Base):
+    """A long-lived login session. Only a SHA-256 hash of the token is stored."""
+
+    __tablename__ = "refresh_tokens"
+    __table_args__ = (Index("ix_refresh_tokens_user_id", "user_id"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # Set when the token is used (it's replaced by a new one), logged out, or revoked.
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class IdempotencyKey(Base):
+    """The saved response for a client's Idempotency-Key, replayed if the request is retried."""
+
+    __tablename__ = "idempotency_keys"
+    __table_args__ = (
+        PrimaryKeyConstraint("user_id", "key"),
+        Index("ix_idempotency_keys_created_at", "created_at"),
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    key: Mapped[str] = mapped_column(String(100))
+    request_hash: Mapped[str] = mapped_column(String(64))
+    status_code: Mapped[int] = mapped_column(Integer)
+    response_body: Mapped[dict] = mapped_column(JSON)
+    location: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class Account(Base):
     __tablename__ = "accounts"
     __table_args__ = (
         # A last line of defence: even a bug can't overdraw a customer or merchant.
         CheckConstraint("account_type = 'SYSTEM' OR balance >= 0", name="ck_accounts_balance_non_negative"),
+        Index("ix_accounts_owner_id", "owner_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    # Empty for system accounts and for accounts created before users existed (admin-only).
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     name: Mapped[str] = mapped_column(String(100))
     account_type: Mapped[AccountType] = mapped_column(enum_column(AccountType))
     balance: Mapped[Decimal] = mapped_column(Numeric(14, 2), default=Decimal("0.00"))
